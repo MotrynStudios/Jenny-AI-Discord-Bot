@@ -8,7 +8,7 @@ import os
 import sys
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Literal
 from datetime import datetime, timezone
 import time
 import asyncio
@@ -31,7 +31,7 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # Import search functionality
 import re
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Jenny'))
-from search import perform_search
+from search import answer_after_search
 from utils import (
     sanitize_final_reply,
     extract_search_query,
@@ -382,35 +382,10 @@ async def process_voice_input(request: VoiceRequest) -> VoiceResponse:
         search_query = None if parse_model_command(response) else extract_search_query(response)
         
         if search_query:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] [Voice API] NEED_SEARCH detected: {search_query}")
-            
-            # Perform search using Tavily
-            search_start = time.time()
-            search_results = await perform_search(search_query)
-            print(f"[{datetime.now(timezone.utc).isoformat()}] [Voice API] Search completed in {(time.time() - search_start)*1000:.0f}ms")
-            
-            if search_results:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] [Voice API] Search results obtained, regenerating response...")
-                # Add search results to context and regenerate
-                messages.append({"role": "assistant", "content": response})  # The NEED_SEARCH response
-                messages.append({"role": "system", "content": f"Web search results for '{search_query}':\n{search_results}"})
-                messages.append({"role": "user", "content": f"{request.username}: {request.transcript}"})
-                
-                # Regenerate response with search context
-                ai_start = time.time()
-                response = await jenny_generate(messages, usage_context=usage_context)
-                print(f"[{datetime.now(timezone.utc).isoformat()}] [Voice API] AI regeneration completed in {(time.time() - ai_start)*1000:.0f}ms")
-            else:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] [Voice API] Search failed, responding without search results")
-                # Use the same fallback message as text mode
-                messages.append({
-                    "role": "system",
-                    "content": "You tried to search the web for that, but the search failed or found nothing useful right now. Tell the user briefly you can't check that right now instead of making something up."
-                })
-                ai_start = time.time()
-                response = await jenny_generate(messages, usage_context=usage_context)
-                print(f"[{datetime.now(timezone.utc).isoformat()}] [Voice API] AI fallback response completed in {(time.time() - ai_start)*1000:.0f}ms")
-        
+            search_start = time.monotonic()
+            response = await answer_after_search(search_query, messages, jenny_generate, usage_context)
+            voice_timings["web_search"] = round((time.monotonic() - search_start) * 1000)
+
         # Dispatch after all model calls, including regeneration after a web search.
         command = parse_model_command(response)
         if command and command[0] != "send_chat":
@@ -458,9 +433,12 @@ async def process_voice_input(request: VoiceRequest) -> VoiceResponse:
         total_time = (time.time() - start_time) * 1000
         print(f"[{datetime.now(timezone.utc).isoformat()}] [Voice API] Total request time: {total_time:.0f}ms")
         
+        chat_only = request.reply_mode == "chat"
+        if chat_only and response and not chat_message:
+            chat_message = response
         return VoiceResponse(
             status="success",
-            response=response,
+            response="" if chat_only else response,
             speaker="Jenny",
             timestamp=datetime.now(timezone.utc).isoformat(),
             reply_mode=request.reply_mode,
@@ -497,6 +475,63 @@ async def add_to_conversation(user_id: str, message: Dict[str, str]) -> Dict[str
     history.append(message)
     save_conversation_history(f"dm:{user_id}", user_id, message.get("username", user_id), history, limit=24)
     return {"status": "added", "user_id": user_id}
+
+class VoiceAction(BaseModel):
+    guild_id: str
+    channel_id: str
+    action: Literal["deafen"]
+    deafened: bool = False
+
+
+class VoiceActionResult(BaseModel):
+    guild_id: str
+    session_id: str
+    error: bool = False
+    detail: str = Field(max_length=1800)
+
+
+# Command acknowledgements live on the API loop and expire with the request.
+pending_voice_actions = {}
+
+
+@app.post("/voice/action")
+async def request_voice_action(action: VoiceAction):
+    if not voice_service_is_online():
+        raise HTTPException(503, "The voice service is offline.")
+    if voice_connections.get(action.guild_id, {}).get("channel_id") != action.channel_id:
+        raise HTTPException(409, "Jenny needs to be in your voice channel. Use /joinvc first.")
+    if len(pending_voice_actions) >= 64:
+        raise HTTPException(429, "The voice service is busy.")
+    action_id = uuid4().hex
+    future = asyncio.get_running_loop().create_future()
+    pending_voice_actions[action_id] = {"action": action, "future": future, "claimed": False}
+    try:
+        return await asyncio.wait_for(future, timeout=9)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "The voice service did not confirm that action in time.")
+    finally:
+        pending_voice_actions.pop(action_id, None)
+
+
+@app.get("/voice/actions/{guild_id}")
+async def claim_voice_action(guild_id: str, session_id: str):
+    if session_id != voice_service_session_id or not voice_service_is_online():
+        return {}
+    for action_id, entry in pending_voice_actions.items():
+        if not entry["claimed"] and entry["action"].guild_id == guild_id and not entry["future"].done():
+            entry["claimed"] = True
+            return {"action_id": action_id, **entry["action"].model_dump()}
+    return {}
+
+
+@app.post("/voice/actions/{action_id}/result")
+async def acknowledge_voice_action(action_id: str, result: VoiceActionResult):
+    entry = pending_voice_actions.get(action_id)
+    if (entry and entry["claimed"] and not entry["future"].done()
+            and result.session_id == voice_service_session_id and entry["action"].guild_id == result.guild_id):
+        entry["future"].set_result({"error": result.error, "detail": result.detail})
+    return {"status": "recorded"}
+
 
 @app.post("/voice/tts")
 async def process_tts(request: TTSRequest) -> Dict[str, Any]:

@@ -6,16 +6,25 @@ For account setup and current quotas, see [API keys and free usage](README.md#ap
 
 ## Credentials
 
+Use a numeric suffix for each key from the same provider. For example:
+
+```ini
+GROQ_API_KEY_1=first_key
+GROQ_API_KEY_2=second_key
+GROQ_API_KEY_5=another_key
+```
+
+Jenny discovers every configured number at startup and tries the keys in numeric order. Gaps are fine. Blank and duplicate values are skipped. Existing unnumbered keys still work and take priority, and an existing `_BACKUP` key is tried after the numbered keys. Restart Python and the voice service after editing `.env`. A provider's keys all use the same configured model.
+
+
 | Setting | Required for | What to enter |
 | --- | --- | --- |
 | `DISCORD_TOKEN` | Running Jenny | The token from the Bot page in the Discord Developer Portal. Both runtimes use it. |
-| `GROQ_API_KEY` | Groq chat, vision or Whisper | A GroqCloud API key. Can serve all three tasks. |
-| `GROQ_API_KEY_BACKUP` | Optional fallback | Another authorized key. Uses the same configured model IDs as the primary. |
-| `OPENROUTER_API_KEY` | Optional OpenRouter text route | An OpenRouter API key. Leave blank if using Groq only. |
-| `GEMINI_API_KEY` | Optional Gemini route | A Google AI Studio API key. Enable it only for an eligible use case. |
-| `TAVILY_API_KEY` | Web search | A Tavily API key. Local pack search works without it. |
-| `TAVILY_API_KEY_BACKUP` | Optional web search fallback | A second authorized Tavily key. |
-| `DEEPGRAM_API_KEY` | Spoken replies | A Deepgram key with access to the selected Flux voice. |
+| `GROQ_API_KEY_1` | Groq chat, vision or Whisper | A GroqCloud API key. Can serve all three tasks. |
+| `OPENROUTER_API_KEY_1` | Optional OpenRouter text route | An OpenRouter API key. Leave blank if using Groq only. |
+| `GEMINI_API_KEY_1` | Optional Gemini route | A Google AI Studio API key. Enable it only for an eligible use case. |
+| `TAVILY_API_KEY_1` | Web search | A Tavily API key. Local pack search works without it. |
+| `DEEPGRAM_API_KEY_1` | Spoken replies | A Deepgram key with access to the selected Flux voice. |
 | `GITHUB_REPORT_TOKEN` | Optional `/report` posting | A fine-grained GitHub token limited to the target repository with **Issues: write**. Blank disables posting. |
 | `GITHUB_REPORT_REPO` | Optional `/report` destination | Repository in `owner/name` form. Defaults to `MotrynStudios/Jenny-AI-Discord-Bot`. Use your own issue tracker for a fork. |
 
@@ -26,7 +35,7 @@ To enable reports, create a [fine-grained token](https://github.com/settings/per
 | Setting | Default | What it changes |
 | --- | --- | --- |
 | `OPENROUTER_MODEL` | `openai/gpt-oss-120b:free` | Model ID used for OpenRouter text calls. The unsuffixed ID is a paid route. |
-| `GROQ_TEXT_MODEL` | `openai/gpt-oss-120b` | Text model used on both Groq keys. |
+| `GROQ_TEXT_MODEL` | `openai/gpt-oss-120b` | Text model used for every Groq key. |
 | `GROQ_VISION_MODEL` | `qwen/qwen3.8-27b` | Model used for image descriptions. See [Groq vision](https://console.groq.com/docs/vision). |
 | `GROQ_STT_MODEL` | `whisper-large-v3` | Speech transcription model for voice notes and Node voice capture. |
 | `GROQ_STT_LANGUAGE` | Empty | Optional language hint for Node voice transcription, for example `en`. Empty lets Whisper detect it. |
@@ -35,7 +44,7 @@ To enable reports, create a [fine-grained token](https://github.com/settings/per
 | `AI_MAX_TOKENS` | `1500` | Upper limit on normal generated replies. Maintenance and trivia have separate output budgets. |
 | `VISION_MAX_TOKENS` | `300` | Maximum tokens for an image description. |
 
-By default chat uses OpenRouter, Groq, Groq backup, then Gemini, skipping providers with missing keys. Image analysis uses Groq, Groq backup, then Gemini. `/setmodel` changes the preferred text or image route in one server, and `/models` shows the configured choices. Memory maintenance and live trivia prefer Gemini when configured. Extraction trivia starts at the last configured provider in the default text route and works back through the chain if needed. A quota or provider error can move the request to another provider. Configuring fallback keys does not guarantee capacity.
+By default chat tries OpenRouter, then Groq, then Gemini. Image analysis tries Groq, then Gemini. Each route tries that provider's keys before moving to the next configured provider. `/setmodel` changes the preferred text or image route in one server, and `/models` shows the configured choices. Memory maintenance and live trivia prefer Gemini when configured. Extraction trivia starts at the last configured provider in the default text route and works back through the chain if needed. Voice notes retry with the next Groq key. Live voice can transcribe separate clips in parallel across its Groq keys. Deepgram and Tavily retry with the next key from their own lists. Keys from the same provider account or project can share quota.
 
 ## Local services and RAG
 
@@ -53,7 +62,7 @@ Use positive integers for token caps, threads, batches and retention. Use a numb
 
 ## Discord settings
 
-Channel IDs, chat reply mode, enabled state and model preferences are stored per server. Set them with `/setmainchannel`, `/setlogschannel`, `/replymode`, `/togglejenny` and `/setmodel`. They do not belong in `.env`. Use a separate bot installation for a separate modpack index.
+Channel IDs, chat reply mode, enabled state and model preferences are stored per server. Set them with `/setmainchannel`, `/setlogschannel`, `/replymode`, `/togglejenny` and `/setmodel`. Ticket panels, reaction-role panels, timed mutes and `/freegames` alert settings are also server-scoped. They do not belong in `.env`. Use a separate bot installation for a separate modpack index.
 
 ## Storage and privacy
 
@@ -62,4 +71,5 @@ Channel IDs, chat reply mode, enabled state and model preferences are stored per
 - `logs/python-runtime.log` and `logs/voice-runtime.log` capture local runtime output and rotate. `logs/voice-turns.jsonl` records individual voice timings and may include transcripts. Extraction and indexing have their own logs.
 - When Jenny calls a provider, the request can contain relevant messages, memories, retrieved pack facts, an image, audio or a search query depending on the feature. Provider data handling is separate from local retention.
 - `/mymemory` displays the caller's saved personal summary privately. `/forgetmydata` clears the caller's conversation memory and saved summary. Usage and audit records have their own retention and are not all erased by this command.
+- Supervised maintenance checks the Discord application owner and current server owner automatically. See [restart and updates](README.md#restart-and-updates).
 - The local API is for two trusted processes on the same machine. Keep it on loopback. Do not include tokens, databases, logs, private prompts, or extracted pack data in Git or in public bug reports.

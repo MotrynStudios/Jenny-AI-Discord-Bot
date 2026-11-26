@@ -65,7 +65,8 @@ from database import (
 from discord_commands import setup_commands, format_saved_output_context
 from model_commands import (ModelCommandContext, command_catalog, contains_control_text,
                             describe_discord_message, execute_model_command, parse_model_command)
-from search import perform_search
+from search import answer_after_search
+from panels import is_ticket_channel
 
 from prompt_builder import build_text_prompt, get_relevant_user_context, limit_history_by_tokens
 from rich_presence import run_minecraft_presence
@@ -608,13 +609,46 @@ async def send_runtime_error_log(guild: discord.Guild, title: str, error: Except
         print(f"[LOGS] Could not post runtime failure to {channel_id}: {send_error}")
 
 
+async def read_voice_note(message: discord.Message) -> str | None:
+    """Transcribe supported recordings and post their transcripts in the source conversation."""
+    attachments = [attachment for attachment in message.attachments
+                   if (attachment.content_type or "").startswith("audio/")
+                   or attachment.filename.lower().endswith((".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".webm"))]
+    transcripts = []
+    for attachment in attachments[:2]:
+        try:
+            if attachment.size > 20 * 1024 * 1024:
+                raise ValueError("The recording exceeds the 20 MB transcription limit.")
+            transcript = await transcribe_audio_attachment(
+                await attachment.read(), attachment.filename, attachment.content_type,
+                {"user_id": str(message.author.id), "guild_id": str(message.guild.id) if message.guild else None},
+            )
+            if transcript:
+                transcripts.append(transcript)
+            else:
+                print(f"[STT] No transcript returned for attachment {attachment.id}")
+        except Exception as error:
+            print(f"[STT] Voice note failed: {type(error).__name__}")
+    if transcripts:
+        text = "\n".join(transcripts)
+        await message.reply(embed=discord.Embed(title="Voice note transcript", description=text[:4000],
+                                                color=discord.Color.blurple()), mention_author=False)
+        return text
+    if attachments:
+        await message.reply(embed=discord.Embed(title="Voice transcription unavailable",
+                            description="I couldn't transcribe this recording. Try a shorter clip or type your message.",
+                            color=discord.Color.red()), mention_author=False)
+    return None
+
+
 async def handle_dm_message(message: discord.Message) -> None:
     """Handle direct messages separately from server messages"""
     username = message.author.display_name
     user_id = str(message.author.id)
-    user_input = message.content
+    voice_transcript = await read_voice_note(message)
+    user_input = "\n".join(part for part in (message.content, voice_transcript) if part)
 
-    print(f"[DM] Received DM from {username}: {user_input[:50]}...")
+    print(f"[DM] Received message from user {message.author.id}")
 
     # Log the incoming DM
     log_dm_text(user_id, username, user_input, "incoming")
@@ -701,10 +735,7 @@ async def handle_dm_message(message: discord.Message) -> None:
             reply = await generate(messages, usage_context=usage_context)
             query = None if parse_model_command(reply) else extract_search_query(reply)
             if query:
-                results = await perform_search(query)
-                if results:
-                    messages.insert(-1, {"role": "system", "content": f"External references (not pack proof):\n{results}"})
-                    reply = await generate(messages, usage_context=usage_context)
+                reply = await answer_after_search(query, messages, generate, usage_context)
             print(f"[DM] Response generated: {reply[:100]}...")
 
         handled, reply = await handle_model_reply(message, reply, conversation_id, user_input)
@@ -813,7 +844,7 @@ async def voice_command_bridge(request, text_channel_id, command=None):
         guild = bot.get_guild(int(request.guild_id))
         actor = guild.get_member(int(request.user_id)) if guild else None
         channel = guild.get_channel_or_thread(int(text_channel_id)) if guild and text_channel_id else None
-        if not actor or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        if not actor or actor.bot or not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return "Set a text channel for my voice commands first." if command else ""
         if not channel.permissions_for(actor).view_channel:
             return "I can't run that in a channel you can't view." if command else ""
@@ -943,6 +974,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_message(message: discord.Message) -> None:
     """Record message-path exceptions and return a clear failure to the sender."""
+    if is_ticket_channel(message.channel):
+        return  # Keep private support messages out of chat memory and external AI prompts.
     if message.author.bot:
         if (bot.user and message.author.id == bot.user.id and not message.flags.ephemeral
                 and (message.embeds or message.interaction_metadata)):
@@ -991,11 +1024,6 @@ async def process_incoming_message(message: discord.Message) -> None:
     is_main_channel = main_channel_id and str(message.channel.id) == main_channel_id
     is_admin = author.guild_permissions.administrator
 
-    # Debug logging
-    print(f"[MSG] Message from {message.author.display_name}: {message.content[:50]}...")
-    print(f"[MSG] Main channel ID: {main_channel_id}, Current channel: {message.channel.id}")
-    print(f"[MSG] Is main channel: {is_main_channel}, Is admin: {is_admin}")
-
     log_message(author.display_name, message.content, str(author.id),
                 str(message.channel.id), str(guild.id))
 
@@ -1004,33 +1032,10 @@ async def process_incoming_message(message: discord.Message) -> None:
             save_image_context(str(message.id), str(guild.id), str(author.id),
                                str(message.channel.id), attachment.url, "")
 
-    # Transcribe Discord voice-message attachments in the configured active channel.
-    audio_attachments = [a for a in message.attachments if
-                         (a.content_type and a.content_type.startswith("audio/")) or
-                         a.filename.lower().endswith((".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".webm"))]
-    voice_transcript = None
-    if is_main_channel and audio_attachments:
-        for attachment in audio_attachments[:2]:
-            try:
-                if attachment.size > 20 * 1024 * 1024:
-                    raise ValueError("voice note exceeds the 20 MB transcription limit")
-                voice_transcript = await transcribe_audio_attachment(
-                    await attachment.read(), attachment.filename, attachment.content_type,
-                    {"user_id": str(author.id), "guild_id": str(guild.id)},
-                )
-                if voice_transcript:
-                    log_message(author.display_name, f"[voice note transcript] {voice_transcript}", str(author.id),
-                                str(message.channel.id), str(guild.id))
-                    transcript_embed = discord.Embed(title="Voice note transcript", description=voice_transcript[:4000],
-                                                     color=discord.Color.blurple())
-                    await message.reply(embed=transcript_embed, mention_author=False)
-            except Exception as error:
-                error_embed = discord.Embed(title="Voice transcription failed", description=str(error)[:1000], color=discord.Color.red())
-                try:
-                    await message.reply(embed=error_embed, mention_author=False)
-                except discord.HTTPException:
-                    pass
-                print(f"[STT] Voice message transcription failed: {error}")
+    voice_transcript = await read_voice_note(message) if is_main_channel else None
+    if voice_transcript:
+        log_message(author.display_name, f"[voice note transcript] {voice_transcript}", str(author.id),
+                    str(message.channel.id), str(guild.id))
 
     await bot.process_commands(message)
 
@@ -1038,10 +1043,9 @@ async def process_incoming_message(message: discord.Message) -> None:
     trigger_content = message.content + (f" {voice_transcript}" if voice_transcript else "")
     contains_name = contains_jenny_name(trigger_content)
     
-    # Audio notes are voice turns and always speak. The saved setting applies
-    # only when a normal chat message is what triggered Jenny's reply.
+    # Voice notes are chat messages. They always get a text reply.
     is_voice_note = bool(voice_transcript)
-    reply_mode = "vc" if is_voice_note else get_setting("reply_mode", "chat", str(guild.id))
+    reply_mode = "chat" if is_voice_note else get_setting("reply_mode", "chat", str(guild.id))
 
     referenced_message = await resolve_reply(message) if message.reference else None
     replying_to_jenny = bool(referenced_message and bot.user and referenced_message.author.id == bot.user.id)
@@ -1153,10 +1157,7 @@ async def respond_to_server_message(message, referenced_message, voice_transcrip
         messages.append({
             "role": "system",
             "content": (
-                "This reply is for a transcribed voice note. Speak the response in Jenny's joined voice channel. "
-                "Do not post the answer in chat unless the speaker explicitly asks for a text copy. For a requested "
-                "copy, start with `CMD:SEND_CHAT:<chat copy>\nVOICE:<short spoken reply>`. The server /replymode "
-                "setting does not change voice-note replies."
+                "A Discord voice note is a chat message. Write the answer in chat without a SEND_CHAT marker."
             ),
         })
     messages.append({"role": "system", "content": command_catalog(bot, author, guild)})
@@ -1322,12 +1323,7 @@ async def respond_to_server_message(message, referenced_message, voice_transcrip
             reply = await generate(messages, usage_context=usage_context)
             query = None if parse_model_command(reply) else extract_search_query(reply)
             if query:
-                results = await perform_search(query)
-                if results:
-                    messages.insert(-1, {"role": "system", "content": f"External web search results (cite/label as external):\n{results}"})
-                    reply = await generate(messages, usage_context=usage_context)
-                else:
-                    reply = "I couldn't find a reliable source for that just now."
+                reply = await answer_after_search(query, messages, generate, usage_context)
             print(f"[AI] Response generated: {reply[:100]}...")
 
             # Safety net: if we actually gave her a real image description but she still
@@ -1355,11 +1351,11 @@ async def respond_to_server_message(message, referenced_message, voice_transcrip
         parts = re.split(r"\nVOICE:\s*", command[1], maxsplit=1, flags=re.I)
         chat_copy = parts[0].lstrip(":").strip()
         spoken = parts[1].strip() if len(parts) == 2 else ""
-        if chat_copy and not contains_control_text(chat_copy):
+        if chat_copy and not is_voice_note and not contains_control_text(chat_copy):
             for chunk in split_into_discord_chunks(chat_copy):
                 await message.reply(chunk, mention_author=False)
-        reply = spoken
-        reply_mode = "vc"
+        reply = (chat_copy or spoken) if is_voice_note else spoken
+        reply_mode = "chat" if is_voice_note else "vc"
     if not reply or contains_control_text(reply):
         return
     reply = extract_corrected_response(sanitize_final_reply(reply))
@@ -1379,11 +1375,7 @@ async def respond_to_server_message(message, referenced_message, voice_transcrip
                 print(f"[Voice] Failed to route reply: {error}")
                 failure = "The voice service couldn't accept the reply."
         if failure:
-            if is_voice_note:
-                await message.reply(embed=discord.Embed(title="Voice reply unavailable", description=failure,
-                                                        color=discord.Color.red()), mention_author=False)
-            else:
-                send_chat = True
+            send_chat = True
     if send_chat:
         for chunk in split_into_discord_chunks(reply):
             await message.reply(chunk, mention_author=False)

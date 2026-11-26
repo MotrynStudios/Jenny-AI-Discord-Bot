@@ -55,7 +55,14 @@ import math
 # API configuration
 PYTHON_API_URL = "http://127.0.0.1:8000"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DM_COMMANDS = {"help", "changelog", "health", "invite", "models", "mods", "modcontents", "trivia", "recipe", "searchpack", "mymemory", "forgetmydata", "myusage"}
+from community_commands import register_community_commands
+from timed_mutes import register_mute
+from panels import register_panels
+from free_games import register_free_games
+from voice_controls import register_voice_controls
+from operations import register_operations
+
+DM_COMMANDS = {"faq", "coinflip", "roll", "help", "changelog", "health", "invite", "models", "mods", "modcontents", "trivia", "recipe", "searchpack", "mymemory", "forgetmydata", "myusage"}
 _PACK_DOCUMENTS_CACHE: list[dict[str, Any]] = []
 _PACK_DOCUMENTS_MTIME: Optional[int] = None
 
@@ -134,7 +141,7 @@ class PagedEmbedView(discord.ui.View):
         self.web_query = web_query
         if web_query is None:
             self.remove_item(self.web_search)
-        self._refresh()
+        self._refresh_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -142,7 +149,7 @@ class PagedEmbedView(discord.ui.View):
             return False
         return True
 
-    def _refresh(self) -> None:
+    def _refresh_buttons(self) -> None:
         total = max(1, len(self.pages))
         self.previous.disabled = self.page <= 0
         self.page_button.label = f"{self.page + 1}/{total}"
@@ -154,7 +161,7 @@ class PagedEmbedView(discord.ui.View):
 
     async def show_page(self, interaction, page):
         self.page = max(0, min(len(self.pages) - 1, page))
-        self._refresh()
+        self._refresh_buttons()
         if self.cache_id is not None:
             set_command_output_page(self.cache_id, self.page)
         await interaction.response.edit_message(embed=self.pages[self.page], view=self)
@@ -559,7 +566,7 @@ class ChangelogPageView(discord.ui.View):
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(0, self.page - 1)
-        self._refresh()
+        self._refresh_buttons()
         await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
     @discord.ui.button(label="1/1", style=discord.ButtonStyle.primary)
@@ -569,10 +576,10 @@ class ChangelogPageView(discord.ui.View):
     @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = min(len(self.entries) - 1, self.page + 1)
-        self._refresh()
+        self._refresh_buttons()
         await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
-    def _refresh(self):
+    def _refresh_buttons(self):
         self.previous.disabled = self.page <= 0
         self.page_button.label = f"{self.page + 1}/{len(self.entries)}"
         self.next.disabled = self.page >= len(self.entries) - 1
@@ -595,7 +602,7 @@ class ChangelogJumpModal(discord.ui.Modal, title="Go to changelog page"):
             await interaction.response.send_message(embed=make_notice_embed(f"Choose a page from 1 to {len(self.pager.entries)}."), ephemeral=False)
             return
         self.pager.page = requested - 1
-        self.pager._refresh()
+        self.pager._refresh_buttons()
         await interaction.response.defer()
         if self.pager.message is not None:
             await self.pager.message.edit(embed=self.pager.make_embed(), view=self.pager)
@@ -1610,6 +1617,8 @@ def setup_commands(bot):
         visible_commands = [
             f"`/{command.name}`" for command in tree.get_commands()
             if (command.name not in admin_only or is_admin)
+            and (not command.default_permissions or (interaction.guild and
+                 interaction.user.guild_permissions.is_superset(command.default_permissions)))
             and (interaction.guild is not None or command.name in DM_COMMANDS)
         ]
         embed = discord.Embed(title="Jenny's command guide", color=discord.Color.blurple())
@@ -2361,6 +2370,13 @@ def setup_commands(bot):
         view = ChangelogPageView(changelog_entries, interaction.user.id)
         await interaction.response.send_message(embed=view.make_embed(), view=view)
         view.message = await interaction.original_response()
+
+    register_community_commands(tree)
+    register_mute(bot)
+    register_panels(bot)
+    register_free_games(bot)
+    register_voice_controls(bot)
+    register_operations(bot)
 
     # Explicit command contexts keep guild-only commands out of DMs and the
     # private command picker, instead of listing unusable commands there.

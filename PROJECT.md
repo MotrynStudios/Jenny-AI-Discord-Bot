@@ -1,6 +1,6 @@
 # Jenny file-by-file guide
 
-This guide covers the public source files and the current workspace additions intended for publication. The published `main` can lag behind a local development copy. Generated data is listed separately.
+This guide covers the public source files. Generated data is listed separately.
 
 ## How the pieces connect
 
@@ -17,9 +17,17 @@ This guide covers the public source files and the current workspace additions in
 | [`Jenny/Prompts.py`](Jenny/Prompts.py) | Jenny's character, channel-specific prompt rules, grounding instructions, and the memory update format. |
 | [`Jenny/prompt_builder.py`](Jenny/prompt_builder.py) | Assembles bounded recent history, summaries and the active request for text, voice or maintenance. |
 | [`Jenny/ai.py`](Jenny/ai.py) | Provider clients, fallback routes, rate limit handling, usage accounting, text, vision, voice-note transcription and trivia generation. |
-| [`Jenny/search.py`](Jenny/search.py) | Tavily search and backup-key fallback. |
+| [`Jenny/search.py`](Jenny/search.py) | Tavily lookup, key fallback, and source-grounded follow-up answers. |
+| [`Jenny/provider_keys.py`](Jenny/provider_keys.py) | Discovers numbered and legacy credentials for Python providers. |
 | [`Jenny/discord_commands.py`](Jenny/discord_commands.py) | Slash commands, permission checks, embed pagers, trivia rounds, usage views and web search modal. |
 | [`Jenny/model_commands.py`](Jenny/model_commands.py) | Parses the model's command output and routes it through the registered slash handler using the real caller and channel. |
+| [`Jenny/community_commands.py`](Jenny/community_commands.py) | Ban, kick, timeout, FAQ, coin flip, and dice commands. |
+| [`Jenny/timed_mutes.py`](Jenny/timed_mutes.py) | Persistent text and voice mute roles, channel overrides, and expiration. |
+| [`Jenny/panels.py`](Jenny/panels.py) | Persistent ticket panels and self-assignable role buttons. |
+| [`Jenny/free_games.py`](Jenny/free_games.py) | Free-game subscriptions, GamerPower alerts, and optional Steam reviews. |
+| [`Jenny/operations.py`](Jenny/operations.py) | Owner checks and Discord commands for supervised restarts and releases. |
+| [`Jenny/release_update.py`](Jenny/release_update.py) | GitHub release lookup and checks for a verified fast-forward installation. |
+| [`Jenny/voice_controls.py`](Jenny/voice_controls.py) | The Discord command for pausing or resuming live voice capture. |
 | [`Jenny/issue_reporting.py`](Jenny/issue_reporting.py) | Collects an explicit public bug report in Discord and submits it to the configured GitHub issue tracker. |
 | [`Jenny/pack_browser.py`](Jenny/pack_browser.py) | Indexes recipe outputs, ingredients, known item tags, names and mod entries for autocomplete and recipe cards. |
 | [`Jenny/trivia_bank.py`](Jenny/trivia_bank.py) | Collects pack facts and builds or loads questions by category and difficulty. |
@@ -37,12 +45,15 @@ This guide covers the public source files and the current workspace additions in
 | File | Responsibility |
 | --- | --- |
 | [`voice_service/index.js`](voice_service/index.js) | Discord voice connection, speech capture, Whisper transcription, the Python bridge, Flux synthesis and playback. |
+| [`voice_service/provider_keys.js`](voice_service/provider_keys.js) | Discovers numbered and legacy credentials for Node providers. |
+| [`voice_service/transcription_queue.js`](voice_service/transcription_queue.js) | Schedules STT clips across keys and drops stale work. |
 | [`voice_service/package.json`](voice_service/package.json) | Node version requirement, launch scripts and direct dependencies. |
 | [`voice_service/package-lock.json`](voice_service/package-lock.json) | Resolved dependency tree used by `npm ci`. Regenerate it with npm when dependencies change. |
 | [`tools/rag/build_index.py`](tools/rag/build_index.py) | Runs the extraction, document processing and vector index stages. |
 | [`tools/rag/extract_modpack_data.py`](tools/rag/extract_modpack_data.py) | Reads mod JARs and supported text configs, writes a manifest, and optionally seeds trivia. |
 | [`tools/rag/process_for_rag.py`](tools/rag/process_for_rag.py) | Turns extracted data into searchable documents and records document statistics. |
 | [`tools/rag/README.md`](tools/rag/README.md) | Data layout, supported formats, build flags and troubleshooting. |
+| [`tools/run_supervised.py`](tools/run_supervised.py) | Starts the runtimes and handles approved restart and install requests. |
 
 ## Setup, documentation and GitHub
 
@@ -57,7 +68,7 @@ This guide covers the public source files and the current workspace additions in
 | [`README.md`](README.md) | Quick start, Discord setup, keys, features, FAQ and support. |
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Every environment setting, defaults, storage and privacy. |
 | [`PROJECT.md`](PROJECT.md) | This file inventory and runtime overview. |
-| [`CHANGELOG.md`](CHANGELOG.md) | Release history and current unreleased changes. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release history. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution rules and local validation commands. |
 | [`SUPPORT.md`](SUPPORT.md) | Contact and reporting instructions. |
 | [`SECURITY.md`](SECURITY.md) | Private vulnerability reporting. |
@@ -68,8 +79,6 @@ This guide covers the public source files and the current workspace additions in
 | [`.github/ISSUE_TEMPLATE/feature_request.yml`](.github/ISSUE_TEMPLATE/feature_request.yml) | Collects feature ideas and the contexts they affect. |
 | [`.github/ISSUE_TEMPLATE/config.yml`](.github/ISSUE_TEMPLATE/config.yml) | Configures the issue chooser and private reporting link. |
 | `config/.gitkeep`, `data/.gitkeep`, `mods/.gitkeep` | Empty placeholders that can keep the expected directories in Git. |
-
-The published version has a second `Jenny/.gitignore`. Its rules duplicate the root ignore file, so the cleaned source keeps the root copy.
 
 ## What stays local
 

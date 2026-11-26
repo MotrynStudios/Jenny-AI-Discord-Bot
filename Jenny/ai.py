@@ -14,6 +14,8 @@ from urllib.parse import urljoin, urlparse
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, RateLimitError
 
+from provider_keys import configured_keys
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 class _Provider:
@@ -42,15 +44,14 @@ class _Provider:
         return self.client.audio
 
 
-def _client(api_key_name: str, base_url: str) -> Optional[_Provider]:
-    api_key = os.getenv(api_key_name)
-    return _Provider(api_key_name, api_key, base_url) if api_key else None
+def _clients(base, url):
+    return tuple(_Provider(name, key, url) for name, key in configured_keys(base))
 
 
-gemini = _client("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/")
-groq = _client("GROQ_API_KEY", "https://api.groq.com/openai/v1")
-groq_backup = _client("GROQ_API_KEY_BACKUP", "https://api.groq.com/openai/v1")
-openrouter = _client("OPENROUTER_API_KEY", "https://openrouter.ai/api/v1")
+_gemini = _clients("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/")
+_groq = _clients("GROQ_API_KEY", "https://api.groq.com/openai/v1")
+_openrouter = _clients("OPENROUTER_API_KEY", "https://openrouter.ai/api/v1")
+
 
 # Use the same GPT-OSS model across providers and backup accounts. Only API
 # keys change between fallbacks; model names are not separate backup settings.
@@ -62,8 +63,34 @@ GROQ_STT_MODEL: str = os.getenv("GROQ_STT_MODEL") or "whisper-large-v3"
 # Vision models (in fallback order)
 GROQ_VISION_MODEL: Optional[str] = os.getenv("GROQ_VISION_MODEL") or "qwen/qwen3.8-27b"
 
+_OPENROUTER_TEXT = (_openrouter, OPENROUTER_MODEL, "OpenRouter")
+_GROQ_TEXT = (_groq, GROQ_TEXT_MODEL, "Groq")
+_GROQ_VISION = (_groq, GROQ_VISION_MODEL, "Groq")
+_GROQ_STT = (_groq, GROQ_STT_MODEL, "Groq")
+_GEMINI = (_gemini, GEMINI_MODEL, "Gemini")
+_CHAT_ROUTES = {
+    "gpt-oss": (_OPENROUTER_TEXT, _GROQ_TEXT, _GEMINI),
+    "gemini": (_GEMINI, _OPENROUTER_TEXT, _GROQ_TEXT),
+}
+_VISION_ROUTES = {"qwen": (_GROQ_VISION, _GEMINI), "gemini": (_GEMINI, _GROQ_VISION)}
+
+
+def _model_routes(groups):
+    for clients, model, provider in groups:
+        for index, client in enumerate(clients, 1):
+            label = f"{provider} key {index}" if len(clients) > 1 else provider
+            yield client, model, label
+
+
+def _describe_route(groups):
+    return [
+        f"{provider} ({model})" + (f" · {len(clients)} keys" if len(clients) > 1 else "")
+        for clients, model, provider in groups if clients
+    ]
+
+
 MAX_TOKENS: int = int(os.getenv("AI_MAX_TOKENS", 1500))
-VISION_MAX_TOKENS: int = int(os.getenv("VISION_MAX_TOKENS", 300))  # Default fallback if not in .env
+VISION_MAX_TOKENS: int = int(os.getenv("VISION_MAX_TOKENS", 300))
 DISCORD_MAX_LENGTH: int = 2000
 # Leave a little headroom under Discord's actual 2000-char hard cap per message
 DISCORD_CHUNK_LIMIT: int = 1900
@@ -113,11 +140,11 @@ def set_active_model(task: str, choice: str, guild_id: str) -> str:
     if not guild_id:
         raise ValueError("Model choices must be changed from a server.")
 
-    if choice == "gemini" and gemini is None:
-        raise ValueError("Gemini is not configured. Add GEMINI_API_KEY to .env and restart Jenny first.")
-    if task == "chat" and choice == "gpt-oss" and not any((openrouter, groq, groq_backup)):
+    if choice == "gemini" and not _gemini:
+        raise ValueError("Gemini is not configured. Add GEMINI_API_KEY_1 to .env and restart Jenny first.")
+    if task == "chat" and choice == "gpt-oss" and not (_openrouter or _groq):
         raise ValueError("GPT-OSS has no configured provider. Add an OpenRouter or Groq key to .env first.")
-    if task == "vision" and choice == "qwen" and not any((groq, groq_backup)):
+    if task == "vision" and choice == "qwen" and not _groq:
         raise ValueError("Qwen vision has no configured Groq provider. Add a Groq key to .env first.")
 
     from database import set_setting
@@ -133,35 +160,19 @@ def get_model_configuration(guild_id: Optional[str] = None) -> Dict[str, Any]:
     """Describe configured IDs, route order, and the per-server active choices."""
     chat_choice = _get_active_model_choice("chat", guild_id)
     vision_choice = _get_active_model_choice("vision", guild_id)
-    # Match the status display to configured clients. This avoids claiming a
-    # fallback is available when its API key is missing from this installation.
-    chat_providers = [
-        (openrouter, f"OpenRouter ({OPENROUTER_MODEL})"),
-        (groq, f"Groq ({GROQ_TEXT_MODEL})"),
-        (groq_backup, f"Groq backup ({GROQ_TEXT_MODEL})"),
-        (gemini, f"Gemini ({GEMINI_MODEL})"),
-    ]
-    vision_providers = [
-        (groq, f"Groq ({GROQ_VISION_MODEL})"),
-        (groq_backup, f"Groq backup ({GROQ_VISION_MODEL})"),
-        (gemini, f"Gemini ({GEMINI_MODEL})"),
-    ]
-    chat_order = (chat_providers[3:4] + chat_providers[:3] if chat_choice == "gemini"
-                  else chat_providers)
-    vision_order = (vision_providers[2:3] + vision_providers[:2] if vision_choice == "gemini"
-                    else vision_providers)
-    chat_route = [label for client, label in chat_order if client is not None]
-    vision_route = [label for client, label in vision_order if client is not None]
+    chat_route = _describe_route(_CHAT_ROUTES[chat_choice])
+    vision_route = _describe_route(_VISION_ROUTES[vision_choice])
     available_chat = []
-    if any((openrouter, groq, groq_backup)):
+    if _openrouter or _groq:
         available_chat.append("gpt-oss")
-    if gemini is not None:
+    if _gemini:
         available_chat.append("gemini")
     available_vision = []
-    if GROQ_VISION_MODEL and any((groq, groq_backup)):
+    if GROQ_VISION_MODEL and _groq:
         available_vision.append("qwen")
-    if gemini is not None:
+    if _gemini:
         available_vision.append("gemini")
+    search_count = len(configured_keys("TAVILY_API_KEY"))
     return {
         "chat": {
             "choice": chat_choice,
@@ -177,7 +188,7 @@ def get_model_configuration(guild_id: Optional[str] = None) -> Dict[str, Any]:
         },
         "stt": GROQ_STT_MODEL,
         "tts": os.getenv("DEEPGRAM_TTS_MODEL") or "flux-haley-en",
-        "search": "Tavily (primary key, then backup key)",
+        "search": f"Tavily · {search_count} configured" if search_count else "Tavily is not configured",
         "maintenance": f"Gemini ({GEMINI_MODEL}) first; normal text fallbacks if it fails",
         "trivia": f"Gemini ({GEMINI_MODEL}) first, then configured text providers",
     }
@@ -189,11 +200,11 @@ def _is_model_in_cooldown(model_name: str) -> bool:
     return available_time is not None and datetime.now() < available_time
 
 
-def _text_ready(client, model):
-    return client is not None and not _is_model_in_cooldown(f"{client.name}:{model}")
+def _model_ready(client, model):
+    return bool(model) and not _is_model_in_cooldown(f"{client.name}:{model}")
 
 
-def _text_provider_error(client, model, label, error):
+def _provider_error(client, model, label, error):
     if isinstance(error, RateLimitError):
         retry_after = error.response.headers.get("retry-after")
         try:
@@ -206,14 +217,16 @@ def _text_provider_error(client, model, label, error):
         _set_model_cooldown(f"{client.name}:{model}", seconds / 60)
         print(f"[AI] {label} ({model}) rate limited for {seconds:.0f}s; trying next provider")
     else:
-        print(f"[AI] {label} ({model}) failed: {type(error).__name__}: {error}")
+        status = getattr(error, "status_code", None)
+        detail = f"HTTP {status}" if status else type(error).__name__
+        print(f"[AI] {label} ({model}) failed: {detail}")
 
 
 def _set_model_cooldown(model_name: str, cooldown_minutes: Optional[int] = None) -> None:
     """Set a model to cooldown for the specified duration."""
     if cooldown_minutes is None:
         cooldown_minutes = DEFAULT_COOLDOWN_MINUTES
-    
+
     available_time: datetime = datetime.now() + timedelta(minutes=cooldown_minutes)
     _model_cooldowns[model_name] = available_time
 
@@ -226,13 +239,13 @@ def _parse_retry_time_from_error(error_message: str) -> Optional[float]:
         minutes = int(match.group(1))
         seconds = float(match.group(2))
         return minutes + (seconds / 60)
-    
+
     # Fallback pattern: "Please try again in 30s"
     match = re.search(r'Please try again in (\d+\.?\d*)s', error_message)
     if match:
         seconds = float(match.group(1))
         return seconds / 60
-    
+
     return None
 
 # Phrases that mean the vision model itself refused/failed to actually look at the image,
@@ -321,22 +334,9 @@ async def generate(messages: List[Dict[str, str]], usage_context: Optional[Mappi
                    max_tokens: Optional[int] = None) -> str:
     """Use the server's selected first model, then preserve its fallback chain."""
     guild_id = usage_context.get("guild_id") if usage_context else None
-    if _get_active_model_choice("chat", guild_id) == "gemini":
-        providers = [
-            (gemini, GEMINI_MODEL, "Gemini primary"),
-            (openrouter, OPENROUTER_MODEL, "OpenRouter fallback"),
-            (groq, GROQ_TEXT_MODEL, "Groq fallback"),
-            (groq_backup, GROQ_TEXT_MODEL, "Groq backup fallback"),
-        ]
-    else:
-        providers = [
-            (openrouter, OPENROUTER_MODEL, "OpenRouter"),
-            (groq, GROQ_TEXT_MODEL, "Groq"),
-            (groq_backup, GROQ_TEXT_MODEL, "Groq backup"),
-            (gemini, GEMINI_MODEL, "Gemini fallback"),
-        ]
-    for client, model, label in providers:
-        if not _text_ready(client, model):
+    groups = _CHAT_ROUTES[_get_active_model_choice("chat", guild_id)]
+    for client, model, label in _model_routes(groups):
+        if not _model_ready(client, model):
             continue
         try:
             response = await client.chat.completions.create(
@@ -350,7 +350,7 @@ async def generate(messages: List[Dict[str, str]], usage_context: Optional[Mappi
                 print(f"[AI] {label} ({model}) generated a response")
                 return _clean_reply(content)
         except Exception as error:
-            _text_provider_error(client, model, label, error)
+            _provider_error(client, model, label, error)
     return "my brain's completely fried right now, try again in a bit?"
 
 
@@ -362,14 +362,8 @@ async def generate_memory_maintenance(messages: List[Dict[str, str]],
     Memory jobs are non-interactive, so they can use the provider with the
     larger available maintenance quota without changing conversational order.
     """
-    providers = [
-        (gemini, GEMINI_MODEL, "Gemini maintenance"),
-        (openrouter, OPENROUTER_MODEL, "OpenRouter maintenance fallback"),
-        (groq, GROQ_TEXT_MODEL, "Groq maintenance fallback"),
-        (groq_backup, GROQ_TEXT_MODEL, "Groq backup maintenance fallback"),
-    ]
-    for client, model, label in providers:
-        if not _text_ready(client, model):
+    for client, model, label in _model_routes(_CHAT_ROUTES["gemini"]):
+        if not _model_ready(client, model):
             continue
         try:
             response = await client.chat.completions.create(
@@ -411,25 +405,19 @@ async def generate_memory_maintenance(messages: List[Dict[str, str]],
             print(f"[AI] {label} ({model}) generated a valid memory update")
             return json.dumps(payload, ensure_ascii=False)
         except Exception as error:
-            _text_provider_error(client, model, label, error)
+            _provider_error(client, model, label, error)
     return "{}"
 
 
 async def generate_pack_trivia(facts, category, difficulty, count, *, extraction=False):
     """Ask a model to write questions whose answer and evidence come from a supplied fact."""
-    text_providers = [
-        (openrouter, OPENROUTER_MODEL, "OpenRouter"),
-        (groq, GROQ_TEXT_MODEL, "Groq"),
-        (groq_backup, GROQ_TEXT_MODEL, "Groq backup"),
-    ]
-    gemini_route = (gemini, GEMINI_MODEL, "Gemini")
-    # The last default text provider leads extraction. Walk back up the route if it fails.
-    providers = [gemini_route, *reversed(text_providers)] if extraction else [gemini_route, *text_providers]
+    # Reverse provider priority for extraction while retaining key order within each provider.
+    groups = tuple(reversed(_CHAT_ROUTES["gpt-oss"])) if extraction else _CHAT_ROUTES["gemini"]
     accepted = []
     used = set()
     normalize = lambda value: re.sub(r"[^\w]+", " ", value.casefold()).strip()
-    for client, model, label in providers:
-        if not _text_ready(client, model) or len(accepted) >= count:
+    for client, model, label in _model_routes(groups):
+        if not _model_ready(client, model) or len(accepted) >= count:
             continue
         remaining = count - len(accepted)
         supplied = {key: fact for key, fact in facts.items() if key not in used}
@@ -488,11 +476,11 @@ async def generate_pack_trivia(facts, category, difficulty, count, *, extraction
                     break
             print(f"[TRIVIA] {label} accepted {len(accepted) - before}/{remaining} {category} questions")
         except Exception as error:
-            _text_provider_error(client, model, f"{label} trivia/{category}", error)
+            _provider_error(client, model, f"{label} trivia/{category}", error)
     return accepted
 
 async def analyze_image(image_url: str, hint: str = "", usage_context: Optional[Mapping[str, Optional[str]]] = None) -> Optional[str]:
-    """Analyze a single image with fallback: primary → backup (key 2) → None if both fail."""
+    """Describe an image using the configured vision providers and their keys."""
     image_items = await _prepare_image_items(image_url)
     if not image_items:
         return None
@@ -521,50 +509,21 @@ async def analyze_image(image_url: str, hint: str = "", usage_context: Optional[
     ]
 
     guild_id = usage_context.get("guild_id") if usage_context else None
-    if _get_active_model_choice("vision", guild_id) == "gemini":
-        vision_models = [
-            (GEMINI_MODEL, gemini, "Gemini primary"),
-            (GROQ_VISION_MODEL, groq, "Groq fallback"),
-            (GROQ_VISION_MODEL, groq_backup, "Groq backup fallback"),
-        ]
-    else:
-        vision_models = [
-            (GROQ_VISION_MODEL, groq, "Groq primary"),
-            (GROQ_VISION_MODEL, groq_backup, "Groq backup"),
-            (GEMINI_MODEL, gemini, "Gemini fallback"),
-        ]
-    
-    for model, client, label in vision_models:
-        if not model or client is None:
+    for client, model, label in _model_routes(_VISION_ROUTES[_get_active_model_choice("vision", guild_id)]):
+        if not _model_ready(client, model):
             continue
-            
-        cooldown_key = f"{label}:{model}"
-        if not _is_model_in_cooldown(cooldown_key):
-            try:
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=vision_messages,
-                    max_tokens=VISION_MAX_TOKENS,
-                    temperature=0.2,
-                )
-                _log_usage(model, response, usage_context)
-                description = response.choices[0].message.content
-
-                if looks_like_vision_refusal(description):
-                    print(f"Vision model ({label}) returned refusal: {description!r}")
-                    continue  # Try next model
-
-                return description
-            except Exception as e:
-                error_str = str(e)
-                if "rate_limit_exceeded" in error_str:
-                    retry_minutes = _parse_retry_time_from_error(error_str)
-                    _set_model_cooldown(cooldown_key, retry_minutes)
-                    print(f"[AI] {model} ({label}) rate limited, trying next (cooldown: {retry_minutes or DEFAULT_COOLDOWN_MINUTES}m)")
-                else:
-                    print(f"[AI] Vision model ({label}) failed: {e}")
-        else:
-            print(f"[AI] {model} ({label}) in cooldown, trying next")
+        try:
+            response = await client.chat.completions.create(
+                model=model, messages=vision_messages, max_tokens=VISION_MAX_TOKENS, temperature=0.2,
+            )
+            _log_usage(model, response, usage_context)
+            description = response.choices[0].message.content
+            if looks_like_vision_refusal(description):
+                print(f"[AI] {label} ({model}) returned no usable image description")
+                continue
+            return description
+        except Exception as error:
+            _provider_error(client, model, f"{label} vision", error)
 
     print("[AI] All vision models failed or refused")
     return None
@@ -572,17 +531,17 @@ async def analyze_image(image_url: str, hint: str = "", usage_context: Optional[
 
 async def transcribe_audio_attachment(data: bytes, filename: str, content_type: Optional[str] = None,
                                      usage_context: Optional[Mapping[str, Optional[str]]] = None) -> Optional[str]:
-    """Transcribe a Discord voice attachment through Groq primary then backup."""
+    """Transcribe a Discord voice attachment through the configured Groq keys."""
     if not data:
         return None
     mime = content_type or "audio/ogg"
-    for label, client in (("Groq primary", groq), ("Groq backup", groq_backup)):
-        if client is None:
+    for client, model, label in _model_routes((_GROQ_STT,)):
+        if not _model_ready(client, model):
             continue
         started = time.perf_counter()
         try:
             result = await client.audio.transcriptions.create(
-                model=GROQ_STT_MODEL,
+                model=model,
                 file=(filename, data, mime),
                 response_format="text",
             )
@@ -597,7 +556,7 @@ async def transcribe_audio_attachment(data: bytes, filename: str, content_type: 
             if transcript:
                 return str(transcript).strip()
         except Exception as error:
-            print(f"[STT] {label} failed: {error}")
+            _provider_error(client, model, f"{label} transcription", error)
     return None
 
 

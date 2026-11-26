@@ -1,6 +1,5 @@
 @echo off
-REM Hybrid Jenny System Launcher
-REM Starts both Python Jenny bot and Node.js voice service
+REM Start the optional voice service after the Python API is running.
 
 cd /d "%~dp0"
 
@@ -27,7 +26,8 @@ echo [2/3] Starting Node.js voice service...
 if not exist voice_service\node_modules (
     echo Installing Node.js dependencies...
     cd voice_service
-    call npm.cmd install
+    call npm.cmd ci
+    if errorlevel 1 exit /b 1
     cd ..
 )
 cd voice_service

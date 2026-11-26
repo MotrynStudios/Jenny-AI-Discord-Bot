@@ -4,7 +4,7 @@ cd /d "%~dp0"
 if exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" "Jenny\Jenny-Bot.py"
 ) else (
-    py -3.10 "Jenny\Jenny-Bot.py"
+    py -3.12 "Jenny\Jenny-Bot.py"
 )
 pause
 

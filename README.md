@@ -10,16 +10,23 @@ You only need to know how to copy API keys, create a Discord bot, and run a few 
 
 ## Contents
 
+- [What's new in 0.95bf](#whats-new-in-095bf)
 - [What Jenny can do](#what-jenny-can-do)
 - [Quick start](#quick-start)
 - [Create and invite your Discord bot](#create-and-invite-your-discord-bot)
   - [Privileged intents](#privileged-intents)
   - [Installation and permissions](#installation-and-permissions)
+  - [Role hierarchy](#role-hierarchy)
 - [API keys and free usage](#api-keys-and-free-usage)
 - [Configure the environment file](#configure-the-environment-file)
 - [Optional voice service](#optional-voice-service)
 - [Minecraft modpack data](#minecraft-modpack-data)
 - [Commands](#commands)
+- [Server tools](#server-tools)
+  - [Moderation](#moderation)
+  - [Tickets and reaction roles](#tickets-and-reaction-roles)
+  - [Free-game alerts](#free-game-alerts)
+  - [Restart and updates](#restart-and-updates)
 - [Memory and data](#memory-and-data)
 - [Resource use](#resource-use)
 - [FAQ](#faq)
@@ -33,6 +40,14 @@ You only need to know how to copy API keys, create a Discord bot, and run a few 
 - [Project files and development](#project-files-and-development)
 - [Support and license](#support-and-license)
 
+## What's new in 0.95bf
+
+- **Moderation and community tools.** Timed text and voice mutes, Discord timeouts, kicks and bans, private ticket panels, self-assignable role panels, and opt-in free-game alerts. Try `/faq`, `/coinflip`, or `/roll` for quick commands.
+- **Voice and search.** `/deafen` pauses listening, other bots are ignored in voice, and live transcription can split clips across several Groq keys. Voice timing reports go to chat. Web search follow-ups cite sources when available.
+- **Flexible setup.** Use one key per provider or add any number of numbered keys. Server owners can check for releases in Discord. On a supervised install, the application owner can also restart Jenny or request a verified update from a server they own.
+
+See the [full changelog](CHANGELOG.md#095bf) for details.
+
 ## What Jenny can do
 
 - Chat in servers and DMs, answer replies to her messages, and use recent context and saved summaries.
@@ -40,6 +55,7 @@ You only need to know how to copy API keys, create a Discord bot, and run a few 
 - Browse your installed mods, search recipe outputs or ingredients, show grids for shaped recipes, and display materials for supported workbench recipes.
 - Host timed solo or multiplayer Minecraft trivia, with separate question categories and a server leaderboard.
 - Run the same Discord commands from natural language, show usage and profiles, and manage roles when both the requester and Jenny have the required permissions.
+- Run a support desk with ticket channels, publish self-assignable role buttons, and post free-game alerts.
 
 ## Quick start
 
@@ -60,7 +76,7 @@ Copy-Item .env.example .env
 
 On macOS or Linux, use `python3.12 -m venv .venv`, `./.venv/bin/python -m pip install -r requirements.txt`, and `cp .env.example .env`. Skip the clone step if you already downloaded the project.
 
-Open `.env` in a text editor. For basic chat, fill in `DISCORD_TOKEN` and, for example, `GROQ_API_KEY`. Leave the other keys blank. Then start Jenny:
+Open `.env` in a text editor. For basic chat, fill in `DISCORD_TOKEN` and, for example, `GROQ_API_KEY_1`. Leave the other keys blank. Then start Jenny:
 
 ~~~powershell
 .\.venv\Scripts\python.exe Jenny\Jenny-Bot.py
@@ -95,23 +111,33 @@ Use `bot` and `applications.commands` for Guild Install. Jenny can use DMs with 
 | Embed Links | For recipe cards, trivia and command reports, and profile embeds. |
 | Send Messages in Threads | If you want Jenny to reply inside threads. |
 | Connect, Speak | In the voice channels you want Jenny to use. |
-| Manage Roles | Only for role changes. Place Jenny's bot role above roles it may manage. The requester must also meet Jenny's admin and role hierarchy checks. |
+| Manage Roles | Assigning and removing roles, reaction-role panels, timed mutes, and the channel permission overwrites used by tickets. |
+| Manage Channels | Creating, editing, and closing ticket channels in the selected category. |
+| Kick Members, Ban Members, Moderate Members | Grant the permissions for `/kick`, `/ban`, and `/timeout` respectively if you plan to use those commands. |
 
-Jenny does not need the **Administrator** permission. Members who should use slash commands need **Use Application Commands** in the channel. Review [Discord permissions](https://docs.discord.com/developers/topics/permissions) and [command permissions](https://docs.discord.com/developers/docs/interactions/slash-commands#permissions) if commands are missing for specific roles.
+For a private test server you control, **Administrator** is an option for trying the full feature set. It gives the bot every server permission and access to channels regardless of channel overrides. For a regular server, grant the permissions in the table for the features you use. Self-hosting lets you control the process and local files. Discord permissions and external API requests still apply.
+
+Members who use slash commands need **Use Application Commands** in the channel. See [Discord permissions](https://docs.discord.com/developers/topics/permissions) and [command permissions](https://docs.discord.com/developers/docs/interactions/slash-commands#permissions) if commands are missing for specific roles.
+
+### Role hierarchy
+
+In Discord, open **Server Settings → Roles**. Drag Jenny's highest role above every role she should assign or remove, including roles offered in reaction panels and the roles used for mutes. For moderation, Jenny also needs to sit above the target member's highest role. Jenny's role can stay under the owner and staff roles she has no reason to manage.
+
+For example, with **Owner → Jenny → Helpers → Members**, Jenny can grant or remove **Helpers** when the requesting member has the required permissions and rank. A member whose highest role is **Owner** remains above Jenny. **Administrator** does not bypass role order. Discord integration-managed roles and the server owner are also protected. [Discord's role hierarchy](https://docs.discord.com/developers/topics/permissions#permission-hierarchy)
 
 ## API keys and free usage
 
-Start with one text provider. Extra keys give Jenny more routes when a provider is unavailable or hits its quota. Backup keys are optional, and keys from the same account or project can share a quota. Use only accounts and credentials you are authorized to use under each provider's terms.
+Start with one text provider. Extra keys give Jenny more routes when a provider is unavailable or hits its quota. Add as many extra keys as needed with numbered names such as `GROQ_API_KEY_2` or `TAVILY_API_KEY_3`. Keys from the same account or project can share a quota. Use only accounts and credentials you are authorized to use under each provider's terms.
 
 | Service | What Jenny uses it for | Get a key and check limits |
 | --- | --- | --- |
-| Groq | GPT-OSS chat, Qwen image analysis, Whisper transcription | Sign into [GroqCloud](https://console.groq.com/keys), create an API key, and paste it into `GROQ_API_KEY`. Check your [account limits](https://console.groq.com/settings/limits) and [rate limit guide](https://console.groq.com/docs/rate-limits). The published free table lists GPT-OSS 120B at 30 requests/minute, 1,000/day, 8,000 tokens/minute, and 200,000/day. Whisper also has audio duration quotas. |
+| Groq | GPT-OSS chat, Qwen image analysis, Whisper transcription | Sign into [GroqCloud](https://console.groq.com/keys), create an API key, and paste it into `GROQ_API_KEY_1`. Check your [account limits](https://console.groq.com/settings/limits) and [rate limit guide](https://console.groq.com/docs/rate-limits). The published free table lists GPT-OSS 120B at 30 requests/minute, 1,000/day, 8,000 tokens/minute, and 200,000/day. Whisper also has audio duration quotas. |
 | OpenRouter | Optional first chat route | Create a key in [OpenRouter settings](https://openrouter.ai/settings/keys). The example uses [GPT-OSS 120B's free variant](https://openrouter.ai/openai/gpt-oss-120b:free). Free variants do not require buying credits and are normally capped at 20 requests/minute and 50/day without a qualifying credit purchase. See the [free model guide](https://openrouter.ai/collections/free-models). |
 | Google Gemini | Optional chat, vision, trivia and memory fallback | Create a key in [Google AI Studio](https://aistudio.google.com/apikey) and verify the project plan. [Model pricing](https://ai.google.dev/gemini-api/docs/pricing) shows which models have free API access. [Limits](https://ai.google.dev/gemini-api/docs/rate-limits) vary by model and project. Gemini's [terms](https://ai.google.dev/gemini-api/terms) have age, audience and regional rules. Leave it disabled if those rules do not fit your server. |
-| Tavily | Optional web lookup | Sign into the [Tavily dashboard](https://app.tavily.com/) and copy a key to `TAVILY_API_KEY`. Tavily documents 1,000 free credits a month without a card. Jenny requests basic search, which uses one credit per call. See [API credits](https://docs.tavily.com/documentation/api-credits). |
+| Tavily | Optional web lookup | Sign into the [Tavily dashboard](https://app.tavily.com/) and copy a key to `TAVILY_API_KEY_1`. Tavily documents 1,000 free credits a month without a card. Jenny requests basic search, which uses one credit per call. See [API credits](https://docs.tavily.com/documentation/api-credits). |
 | Deepgram | Optional spoken responses | Create a project and API key in the [Deepgram console](https://console.deepgram.com/). Deepgram documents a [$200 starter credit](https://developers.deepgram.com/guides/fundamentals/make-your-first-api-request). Check [pricing](https://deepgram.com/pricing) and your project's [Flux TTS](https://developers.deepgram.com/docs/flux-tts/voices) access. Credit can run out. |
 
-You can run basic Jenny chat on a supported free tier without linking a credit card. Keep paid billing off and use the exact free model ID where a provider has separate paid and free routes. Provider quotas, eligibility, verification and availability can change. Free access is limited and optional voice uses Deepgram credits. You can skip a service if its terms or signup requirements do not work for you.
+You can run basic Jenny chat on a supported free tier without linking a credit card. Keep paid billing off and use the exact free model ID where a provider has separate paid and free routes. Check the linked dashboards for current limits and model availability. Optional voice uses Deepgram credits. You can skip a service if its terms or signup requirements do not work for you.
 
 ## Configure the environment file
 
@@ -121,7 +147,7 @@ Minimal example with placeholders:
 
 ~~~dotenv
 DISCORD_TOKEN=replace_with_your_bot_token
-GROQ_API_KEY=replace_with_your_groq_key
+GROQ_API_KEY_1=replace_with_your_groq_key
 ~~~
 
 Keep `.env` private. A previously configured `OPENROUTER_MODEL=openai/gpt-oss-120b` still selects the paid route. Set `OPENROUTER_MODEL=openai/gpt-oss-120b:free` to use the free variant.
@@ -137,7 +163,7 @@ node voice_service/index.js
 
 On Windows, `.\RUN_VOICE_SERVICE.bat` starts the installed Node runtime. `.\start_hybrid_system.bat` checks that the Python API is already reachable and opens the voice service in a second window. Both processes use the same Discord bot token. They have separate runtime logs. Use `/joinvc` from a server voice channel, and `/leavevc` to disconnect.
 
-`/replymode` controls future **chat-triggered** replies. Voice turns normally speak. A requested text copy or a command with a Discord result can appear in the configured text channel.
+`/replymode` controls future **chat-triggered** replies. Live voice turns normally speak. Ask for a text copy if you want one. Command results such as voice timings still go to the text channel. Jenny transcribes voice notes in DMs and in the main text channel. Replies to voice notes are text. Use `/deafen` to pause listening or `/deafen deafened:False` to resume. Jenny ignores audio from other bots. With several distinct Groq keys, live transcription can process one clip per key in parallel. Stale clips expire under load.
 
 ## Minecraft modpack data
 
@@ -155,23 +181,69 @@ Jenny searches extracted data for installed pack facts. Recipe cards use source 
 
 ## Commands
 
-Use `/help` to see commands you can run in the current context. You can also ask Jenny to run a command in chat, DMs, or voice. Admin and role checks still apply.
+Use `/help` to see commands you can run in the current context. You can also ask Jenny to run a supported command in chat, DMs, or voice. Admin and role checks still apply. Moderation, panel setup, free-game configuration, and host maintenance use slash commands.
 
 | Area | Commands |
 | --- | --- |
 | Setup, health and feedback | `/help`, `/health`, `/invite`, `/report`, `/setmainchannel`, `/getmainchannel`, `/setlogschannel`, `/getlogschannel`, `/togglejenny`, `/models`, `/setmodel`, `/changelog` |
 | Minecraft | `/mods`, `/modcontents`, `/recipe`, `/searchpack`, `/trivia`, `/trivialeaderboard`, `/generatetrivia` (admin) |
-| Voice | `/joinvc`, `/leavevc`, `/voicestatus`, `/replymode`, `/voicetimes` |
+| Voice | `/joinvc`, `/leavevc`, `/voicestatus`, `/replymode`, `/voicetimes`, `/deafen` |
+| Server tools | `/mute`, `/ban`, `/kick`, `/timeout`, `/ticketpanel`, `/reactionroles`, `/freegames`, `/restart`, `/update` |
+| Quick commands | `/faq`, `/coinflip`, `/roll` |
 | People and roles | `/serverinfo`, `/user`, `/profile`, `/avatar`, `/roles`, `/profilehistory`, `/recentchanges`, `/finduser`, `/lastseen`, `/assignrole`, `/removerole`, `/refreshprofiles` |
 | Memory and usage | `/searchchat`, `/summarize`, `/mymemory`, `/forgetmydata`, `/forgetme`, `/myusage`, `/tokenusage` |
 
 `/recipe item:` searches outputs and `used_item:` searches ingredients. `/mods mod:` filters the roster and `/modcontents mod:` browses one mod by category. When a result spans multiple pages, use **Back**, **Next**, or the page number to navigate.
 
+
+## Server tools
+
+### Moderation
+
+Use `/mute member: minutes: mode:` to temporarily restrict text, voice or both. Jenny creates a role for the selected mode on first use. **Text** blocks posting and starting threads. **Voice** blocks speaking in voice and sending voice recordings. **Both** applies both sets of restrictions. Where posting is blocked, members also cannot upload voice recordings in that channel. Use zero minutes to remove Jenny's active mute early. Expiration survives a restart. The requester needs **Manage Roles** and **Moderate Members**. Jenny needs **Manage Roles** in the affected channels and must be above the member and mute roles.
+
+`/timeout` uses Discord's built-in timeout for up to 28 days. Use zero minutes to clear it. `/kick` removes a current member. `/ban` prevents a current member from returning and keeps their message history. Discord permissions and both role hierarchies apply. These commands are available as slash commands.
+
+### Tickets and reaction roles
+
+Run `/ticketpanel category:` in the channel where the panel should appear. In the modal, set a title, a description, a hex embed color such as `#5865F2`, and a JSON list with one object per button. The list can contain up to 25 buttons. Turn on Discord Developer Mode to copy role IDs. Replace the example IDs with roles from your server. Use `"roles":[]` if a ticket type should have no staff role.
+
+```json
+[
+  {"label":"Help","emoji":"🎫","roles":["123456789012345678"],"message":"What can we help you with?"},
+  {"label":"Report a bug","emoji":"🐛","roles":["234567890123456789"],"message":"What happened, and how can we reproduce it?"}
+]
+```
+
+Each button creates a private text channel in the selected category for the member, Jenny, and the configured staff roles. Discord administrators retain access. Each member can have one open ticket per button. The welcome post pings the configured roles if Discord allows Jenny to mention them. Use mentionable roles or give Jenny **Mention Everyone** specifically where those pings are needed. **Close ticket** hides the channel from the opener and preserves it for staff. Staff can delete closed channels when their retention policy allows it. Jenny keeps ticket-channel messages out of automated chat memory and AI prompts.
+
+Run `/reactionroles title:` in the channel where the panel should appear. Pick a role, choose blue, gray, green or red, and pick an optional icon from the included options or server emojis. Select **Add button** for each role, then **Publish** when ready.
+
+Click a shared button to add or remove its role. Discord uses the same color for a public button for everyone. The private confirmation provides a red **Remove role** button for the member who clicked. Jenny must be above the roles and have **Manage Roles**. Staff permissions make a role ineligible. Both kinds of panel survive a bot restart.
+
+### Free-game alerts
+
+Run `/freegames` with a destination channel and platform, and opt in to DLC and loot if wanted. Run it with `enabled:False` to stop alerts. Jenny polls [GamerPower](https://www.gamerpower.com/api-read) every 30 minutes without a key, and remembers the offers it has already posted in that channel. The embed links to the claim page and the original listing. It includes the description, the listed expiry and, when the claim points to a verified Steam app, [Steam user reviews](https://partner.steamgames.com/doc/webapi/IUserReviewsService). Availability varies by region and store.
+
+### Restart and updates
+
+The server owner can run `/update` to compare the local checkout tag or changelog version with the latest GitHub release and read its notes. The check also works on a ZIP installation.
+
+Start Jenny under the supervisor to enable `/restart` and `/update install:True`:
+
+```bash
+python tools/run_supervised.py --voice
+```
+
+Omit `--voice` for Python only. Close existing Jenny runtimes before starting the supervisor. The member requesting a restart or installation must own both the current Discord server and the Jenny application. For team-owned applications, Jenny checks the Discord team owner. It looks these identities up through Discord, so no guild or operator ID is required.
+
+Installing an update needs a clean Git checkout on `main` with the official HTTPS origin. Jenny verifies that the fetched tag points at the same commit GitHub reported, checks changed code for syntax errors, and permits only a fast-forward that preserves local files. Releases that change dependencies need to be installed from the host. Jenny announces the result and release notes after reconnecting.
+
 ## Memory and data
 
 Jenny keeps recent conversation turns per Discord user and conversation. The Python task summarizes active streams and keeps dated personal summaries for seven days. Durable personal details are keyed by Discord user ID across that person's DMs, server chat and voice. Channel summaries and raw conversations are scoped to their source. Recent visible command results can be included as context in the same channel.
 
-Local storage includes `Jenny/memory.db`, generated pack data under `data/`, and runtime logs under `logs/`. Depending on enabled features and the request, selected chat, images, audio, pack facts, or search queries are sent to the configured API provider. Discuss voice transcription and data retention with your server members before enabling them. See [configuration and storage](CONFIGURATION.md#storage-and-privacy).
+The database, generated pack files, and runtime logs live on the host that runs Jenny. Discord still handles the messages, attachments, and voice traffic. When enabled, model routes receive the relevant message context, saved memories, and pack excerpts. Vision sends images or sampled frames for analysis. Transcription sends audio to Groq, spoken replies send text to Deepgram, and web lookup sends queries to Tavily. If you enable `/report`, submitted report text becomes a GitHub issue. Discuss these settings and data retention with your server before enabling them. See [configuration and storage](CONFIGURATION.md#storage-and-privacy).
 
 ## Resource use
 
@@ -197,7 +269,7 @@ Check that the installed JAR was extracted and the index build completed. Some m
 
 ### Why does a provider return 429?
 
-Its quota or rate limit has been reached. Jenny can try the next configured provider. Wait for the limit to reset or reduce traffic. A second key tied to the same quota usually cannot increase it.
+Its quota or rate limit has been reached. Jenny can try another configured key or provider. Wait for the limit to reset or reduce traffic. A second key tied to the same quota usually cannot increase it.
 
 ### Can I change her personality?
 

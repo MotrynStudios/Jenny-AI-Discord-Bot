@@ -2136,7 +2136,7 @@ def get_changelog() -> List[Dict[str, Any]]:
 # Function to initialize changelog entries (call this after bot is fully started)
 def initialize_changelog() -> None:
     """Import the current Markdown release notes without deleting stored history."""
-    version = "0.94bf"
+    version = "0.95bf"
     try:
         markdown = (_SCRIPT_DIR.parent / "CHANGELOG.md").read_text(encoding="utf-8")
         release = markdown.partition(f"\n## {version}\n")[2].partition("\n## ")[0]
@@ -2151,7 +2151,7 @@ def initialize_changelog() -> None:
             raise ValueError(f"Missing notes for version {version} in CHANGELOG.md")
         add_changelog_entry(
             version=version,
-            description="Recipe trivia, question bank tools, and the new GitHub repository name",
+            description="Server tools, voice improvements, and flexible provider keys",
             features=features,
             changes=changes,
             entry_type="release",

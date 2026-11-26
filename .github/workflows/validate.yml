@@ -25,4 +25,7 @@ jobs:
       - name: Compile Python source
         run: python -m compileall -q Jenny jenny_api_server.py jenny_rag_integration.py tools
       - name: Check voice service syntax
-        run: node --check voice_service/index.js
+        run: |
+          node --check voice_service/index.js
+          node --check voice_service/provider_keys.js
+          node --check voice_service/transcription_queue.js

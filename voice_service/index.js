@@ -8,6 +8,8 @@
 const { Client, GatewayIntentBits } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, EndBehaviorType, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 const prism = require('prism-media');
+const { createTranscriptionQueue } = require('./transcription_queue');
+const { configuredKeys } = require('./provider_keys');
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
@@ -74,7 +76,7 @@ for (const stream of [process.stdout, process.stderr]) {
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 // Backward compatibility for existing local installs: use the old voice-only
 // file only when the shared root environment does not provide Deepgram.
-if (!process.env.DEEPGRAM_API_KEY) {
+if (!configuredKeys('DEEPGRAM_API_KEY').length) {
     require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 }
 
@@ -123,8 +125,8 @@ async function reportServiceUsage(service, durationMs, guildId, userId) {
         console.warn(`[Usage] Could not record ${service} time: ${error.message}`);
     }
 }
-const GROQ_API_KEYS = [process.env.GROQ_API_KEY, process.env.GROQ_API_KEY_BACKUP].filter(Boolean);
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const GROQ_API_KEYS = configuredKeys('GROQ_API_KEY');
+const DEEPGRAM_API_KEYS = configuredKeys('DEEPGRAM_API_KEY');
 
 // Groq API endpoints (STT only)
 const GROQ_STT_MODEL = process.env.GROQ_STT_MODEL || 'whisper-large-v3';
@@ -151,14 +153,33 @@ const audioBuffers = new Map();
 const voiceChannels = new Map(); // Store voice channel references
 const textChannels = new Map(); // The server channel used for text replies
 
+const deafenedGuilds = new Set();
+const speechControllers = new Map();
+const voiceTurns = new Map();
+const captureVersions = new Map();
+
+async function sendVoiceText(guildId, text) {
+    const channel = getTextChannel(guildId);
+    if (!channel?.isSendable()) {
+        console.warn('[Voice] Text reply channel unavailable for guild', guildId);
+        return;
+    }
+    try {
+        for (let offset = 0; offset < text.length; offset += 1900) {
+            await channel.send({ content: text.slice(offset, offset + 1900), allowedMentions: { parse: [] } });
+        }
+    } catch (error) {
+        console.warn('[Voice] Could not send text reply:', error.message);
+    }
+}
+
 function getTextChannel(guildId) {
     const guild = client.guilds.cache.get(guildId);
     if (!guild) return null;
     const configured = textChannels.get(guildId);
     const configuredChannel = configured && guild.channels.cache.get(configured);
     if (configuredChannel?.isTextBased()) return configuredChannel;
-    return guild.systemChannel ||
-        guild.channels.cache.find(channel => channel.isTextBased() && channel.guildId === guildId) || null;
+    return null;
 }
 
 async function notifyPythonVoiceStatus(guildId, inVoice, channelId = null) {
@@ -190,16 +211,28 @@ function getTTSState(guildId) {
 // so speaking 'start' firing again (which happens more often than the stream's
 // own silence timeout closes it) doesn't stack duplicate listeners on the same
 // cached Opus stream.
-const activePipelines = new Set();
+const activePipelines = new Map();
 
 // Debounce for end-of-speech: Discord's speaking indicator can fire 'end'
 // then 'start' again within milliseconds mid-sentence (breaths, brief pauses),
 // so a flush scheduled on 'end' gets cancelled here if 'start' fires again
 // before the debounce window elapses, meaning it wasn't really the end of the
 // utterance yet.
-const pendingFlushTimeouts = new Map(); // userId -> Timeout
+const pendingFlushTimeouts = new Map(); // guild:user -> Timeout
 const FLUSH_DEBOUNCE_MS = 300;
 const SILENCE_END_MS = 300;
+
+function resetCapture(guildId, connection) {
+    audioBuffers.delete(guildId);
+    captureVersions.set(guildId, Symbol());
+    for (const [key, timeout] of pendingFlushTimeouts) {
+        if (key.startsWith(guildId + ':')) {
+            clearTimeout(timeout);
+            pendingFlushTimeouts.delete(key);
+        }
+    }
+    for (const subscription of connection?.receiver.subscriptions.values() || []) subscription.destroy();
+}
 
 function isVoiceMemberMuted(member) {
     return !member?.voice || member.voice.mute || member.voice.selfMute || member.voice.deaf || member.voice.selfDeaf;
@@ -248,8 +281,29 @@ function flushUserAudio(guildId, userId) {
     if (chunks.length === 0) return;
 
     console.log(`[Voice] Flushing audio from user ${userId} (${chunks.length} chunks)`);
-    processAudio(guildId, userId, chunks);
     userBuffers.set(userId, []);
+    if (deafenedGuilds.has(guildId)) return;
+    const voice = voiceChannels.get(guildId);
+    const member = voice?.members.get(userId);
+    if (!member || member.user.bot) return;
+    const key = guildId + ':' + userId;
+    const active = voiceTurns.get(key) || { last: null, pending: 0 };
+    if (active.pending >= 4) {
+        console.warn("[Voice] Ignored a clip because the speaker has four unfinished turns");
+        return;
+    }
+    const connection = voiceConnections.get(guildId);
+    const version = captureVersions.get(guildId);
+    const capturedAt = Date.now();
+    const cancelled = () => voiceConnections.get(guildId) !== connection || deafenedGuilds.has(guildId)
+        || captureVersions.get(guildId) !== version || !voiceChannels.get(guildId)?.members.has(userId)
+        || Date.now() - capturedAt > 40000;
+    active.pending++;
+    active.last = processAudio(guildId, userId, chunks, active.last, cancelled);
+    voiceTurns.set(key, active);
+    void active.last.finally(() => {
+        if (--active.pending === 0 && voiceTurns.get(key) === active) voiceTurns.delete(key);
+    });
 }
 
 /**
@@ -314,7 +368,7 @@ function filterNoiseTranscript(transcript) {
 /**
  * Process accumulated audio chunks
  */
-async function processAudio(guildId, userId, chunks) {
+async function processAudio(guildId, userId, chunks, previous, cancelled) {
     const timing = new TimingTracker('Audio Processing');
     const timingsMs = { speech_capture: Math.max(0, chunks.length * 20) };
     
@@ -337,11 +391,14 @@ async function processAudio(guildId, userId, chunks) {
         // Transcribe using Groq
         console.log(`[${getTimestamp()}] [Voice] Sending to Groq for transcription...`);
         stageStartedAt = Date.now();
-        const transcript = await transcribeAudio(wavBuffer, guildId, userId);
+        const transcript = await transcribeAudio(wavBuffer, guildId, userId, cancelled);
         timingsMs.stt = Date.now() - stageStartedAt;
         console.log(`[${getTimestamp()}] [Voice] Transcription result: "${transcript}"`);
         timing.checkpoint('STT (Groq)');
         
+        // Wait for earlier turns after dispatching transcription, even when this clip produced no text.
+        await previous;
+        if (cancelled()) return;
         if (!transcript) {
             console.log(`[${getTimestamp()}] [Voice] No transcript returned, skipping processing`);
             timing.end();
@@ -435,32 +492,31 @@ async function processAudio(guildId, userId, chunks) {
 /**
  * Transcribe audio using Groq Whisper
  */
-async function transcribeAudio(audioBuffer, guildId = null, userId = null) {
-    const timing = new TimingTracker('STT Request');
-    const startedAt = Date.now();
-    for (let index = 0; index < GROQ_API_KEYS.length; index += 1) {
-        const formData = new FormData();
-        formData.append('file', audioBuffer, { filename: 'audio.wav', contentType: 'audio/wav' });
-        formData.append('model', GROQ_STT_MODEL);
-        if (GROQ_STT_LANGUAGE) formData.append('language', GROQ_STT_LANGUAGE);
-        formData.append('response_format', 'json');
-        try {
-            const response = await axios.post(`${GROQ_API_URL}/audio/transcriptions`, formData, {
-                headers: {
-                    'Authorization': `Bearer ${GROQ_API_KEYS[index]}`,
-                    ...formData.getHeaders()
-                }
-            });
-            timing.checkpoint(index === 0 ? 'Groq primary response' : 'Groq backup response');
-            timing.end();
-            void reportServiceUsage('stt', Date.now() - startedAt, guildId, userId);
-            return filterNoiseTranscript(response.data.text);
-        } catch (error) {
-            console.error(`[${getTimestamp()}] [Voice] Groq STT key ${index + 1} failed:`, error.response?.data || error.message);
-        }
+const sttQueue = createTranscriptionQueue(GROQ_API_KEYS, async (key, audioBuffer, timeout) => {
+    const form = new FormData();
+    form.append('file', audioBuffer, { filename: 'audio.wav', contentType: 'audio/wav' });
+    form.append('model', GROQ_STT_MODEL);
+    if (GROQ_STT_LANGUAGE) form.append('language', GROQ_STT_LANGUAGE);
+    form.append('response_format', 'json');
+    try {
+        const { data } = await axios.post(GROQ_API_URL + '/audio/transcriptions', form, {
+            headers: { Authorization: 'Bearer ' + key, ...form.getHeaders() }, timeout,
+        });
+        return data.text;
+    } catch (error) {
+        console.warn('[Voice] Groq STT request failed:', error.response?.status || error.code || 'request error');
+        throw error;
     }
-    timing.end();
-    return null;
+});
+
+async function transcribeAudio(audioBuffer, guildId, userId, cancelled) {
+    const result = await sttQueue(audioBuffer, cancelled);
+    if (!result) {
+        if (!cancelled()) console.warn('[Voice] Dropped an expired or failed speech recognition request');
+        return null;
+    }
+    void reportServiceUsage('stt', result.duration, guildId, userId);
+    return filterNoiseTranscript(result.text);
 }
 
 /**
@@ -484,64 +540,48 @@ function sanitizeTextForTTS(text) {
  * Generate speech using Deepgram Flux TTS (v2)
  */
 async function generateSpeech(text, guildId = null, userId = null) {
+    const sanitizedText = sanitizeTextForTTS(text);
+    if (!sanitizedText || !DEEPGRAM_API_KEYS.length) return null;
+
+    const controller = new AbortController();
+    if (!speechControllers.has(guildId)) speechControllers.set(guildId, new Set());
+    const controllers = speechControllers.get(guildId);
+    controllers.add(controller);
     const timing = new TimingTracker('TTS Generation');
-    const startedAt = Date.now();
 
     try {
-        // Sanitize text to remove non-Latin characters before TTS
-        const sanitizedText = sanitizeTextForTTS(text);
-        if (!sanitizedText) {
-            console.warn('[Voice] Refusing to synthesize empty text after formatting cleanup');
-            timing.end();
-            return null;
-        }
-        console.log(`[${getTimestamp()}] [Voice] Generating TTS for:`, sanitizedText);
-        console.log(`[${getTimestamp()}] [Voice] Using Deepgram Flux model:`, DEEPGRAM_TTS_MODEL);
-
-        const response = await axios.post(`${DEEPGRAM_API_URL}?model=${DEEPGRAM_TTS_MODEL}&speed=1.1&expressivity=0`, {
-            text: sanitizedText
-        }, {
-            headers: {
-                'Authorization': `Token ${DEEPGRAM_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
-            responseType: 'arraybuffer',
-            timeout: 10000  // 10 second timeout for TTS generation
-        });
-
-        timing.checkpoint('Deepgram API response');
-        const audioBuffer = Buffer.from(response.data);
-        console.log(`[${getTimestamp()}] [Voice] Deepgram TTS generated, buffer size:`, audioBuffer.length, 'bytes');
-        
-        if (audioBuffer.length === 0) {
-            console.error(`[${getTimestamp()}] [Voice] ERROR: Deepgram TTS returned empty buffer!`);
-            timing.end();
-            return null;
-        }
-        
-        // Check if it's actually an error response (JSON instead of audio)
-        if (audioBuffer.length < 1000) {
-            const header = audioBuffer.toString('utf8', 0, Math.min(100, audioBuffer.length));
-            if (header.includes('{') || header.includes('error')) {
-                console.error('[Voice] ERROR: Deepgram TTS returned JSON error instead of audio:', header);
-                return null;
+        for (const [index, key] of DEEPGRAM_API_KEYS.entries()) {
+            if (controller.signal.aborted) return null;
+            try {
+                const response = await axios.post(
+                    DEEPGRAM_API_URL + '?model=' + encodeURIComponent(DEEPGRAM_TTS_MODEL) + '&speed=1.1&expressivity=0',
+                    { text: sanitizedText },
+                    {
+                        headers: { Authorization: 'Token ' + key, 'Content-Type': 'application/json' },
+                        responseType: 'arraybuffer', signal: controller.signal, timeout: 10000,
+                    },
+                );
+                if (controller.signal.aborted) return null;
+                const audio = Buffer.from(response.data);
+                const contentType = response.headers?.['content-type'] || '';
+                if (!audio.length || contentType.includes('json')) {
+                    console.warn('[Voice] Deepgram key ' + (index + 1) + ' returned no audio');
+                    continue;
+                }
+                timing.checkpoint('Deepgram response');
+                void reportServiceUsage('tts', Date.now() - timing.startTime, guildId, userId);
+                return audio;
+            } catch (error) {
+                if (controller.signal.aborted) return null;
+                const detail = error.response?.status || error.code || 'request error';
+                console.warn('[Voice] Deepgram key ' + (index + 1) + ' failed:', detail);
             }
         }
-        
-        timing.end();
-        void reportServiceUsage('tts', Date.now() - startedAt, guildId, userId);
-        return audioBuffer;
-    } catch (error) {
-        console.error(`[${getTimestamp()}] [Voice] Deepgram TTS failed:`, error.response?.data || error.message);
-        
-        // Log the actual error response if available
-        if (error.response?.data) {
-            const errorText = Buffer.from(error.response.data).toString('utf8');
-            console.error(`[${getTimestamp()}] [Voice] Deepgram error response:`, errorText);
-        }
-        
-        timing.end();
         return null;
+    } finally {
+        timing.end();
+        controllers.delete(controller);
+        if (!controllers.size && speechControllers.get(guildId) === controllers) speechControllers.delete(guildId);
     }
 }
 
@@ -641,6 +681,7 @@ function cancelPendingTTS(guildId) {
  * Stop TTS playback (interruption)
  */
 async function stopTTSPlayback(guildId) {
+    for (const controller of speechControllers.get(guildId) || []) controller.abort();
     try {
         cancelPendingTTS(guildId);
         return true;
@@ -917,23 +958,11 @@ async function sendToPythonAPI(userId, username, transcript, guildId, channelId,
             user_id: userId, username, transcript, guild_id: guildId, channel_id: channelId,
             reply_mode: 'vc', is_voice_message: true,
             timings_ms: timingsMs, speech_duration_ms: speechDurationMs,
-        });
+        }, { timeout: 38000 });
         timingsMs.python_api = Date.now() - startedAt;
         if (data.status !== 'success') return;
 
-        if (data.chat_message) {
-            const channel = getTextChannel(guildId);
-            if (channel) {
-                for (let offset = 0; offset < data.chat_message.length; offset += 1900) {
-                    await channel.send({
-                        content: data.chat_message.slice(offset, offset + 1900),
-                        allowedMentions: { parse: [] },
-                    });
-                }
-            } else {
-                console.warn('[Voice] No configured text channel for the requested copy');
-            }
-        }
+        if (data.chat_message) await sendVoiceText(guildId, data.chat_message);
         const speech = data.response?.trim();
         if (speech?.toUpperCase() === 'KILLTTS') {
             await stopTTSPlayback(guildId);
@@ -945,14 +974,13 @@ async function sendToPythonAPI(userId, username, transcript, guildId, channelId,
 
         pendingResponses.set(guildId, { userId, transcript, timestamp: Date.now() });
         const ttsStartedAt = Date.now();
-        await playTTSInChunks(guildId, speech, userId);
-        await axios.post(PYTHON_API_URL + '/voice/turn/timing', {
+        void playTTSInChunks(guildId, speech, userId).then(() => axios.post(PYTHON_API_URL + '/voice/turn/timing', {
             guild_id: guildId, user_id: userId, username, transcript,
             timings_ms: {
                 python_api: timingsMs.python_api,
                 tts_generation_and_playback: Date.now() - ttsStartedAt,
             },
-        }, { timeout: 2000 });
+        }, { timeout: 2000 })).catch(error => console.warn('[Voice] Could not record speech timing:', error.message));
     } catch (error) {
         console.error('[Voice] Could not complete voice turn:', error.message);
     } finally {
@@ -1062,6 +1090,9 @@ async function pollVoiceCommands() {
                         const voiceChannel = target;
                         if (voiceChannel) {
                             const currentConnection = voiceConnections.get(guild.id);
+                            await stopTTSPlayback(guildId);
+                            resetCapture(guildId, currentConnection);
+                            deafenedGuilds.delete(guildId);
                             if (currentConnection && currentConnection.state.status !== VoiceConnectionStatus.Destroyed) currentConnection.destroy();
                             console.log(`[Voice] Attempting to join voice channel: ${voiceChannel.name} (${voiceChannel.id})`);
                             
@@ -1102,6 +1133,7 @@ async function pollVoiceCommands() {
                                 // Set up speaking event handlers
                                 let speakingEventCount = 0;
                                 receiver.speaking.on('start', (userId) => {
+                                    const key = guildId + ':' + userId;
                                     speakingEventCount++;
                                     if (speakingEventCount % 25 === 0 || speakingEventCount === 1) {
                                         console.log(`[Voice] Speaking event fired! Count: ${speakingEventCount}, User: ${userId}`);
@@ -1110,6 +1142,7 @@ async function pollVoiceCommands() {
                                     if (userId === client.user.id) return;
 
                                     const member = voiceChannel.members.get(userId);
+                                    if (member?.user.bot || deafenedGuilds.has(guildId)) return;
                                     if (!member) {
                                         console.error('[Voice] Member not found for speaking event');
                                         return;
@@ -1126,9 +1159,9 @@ async function pollVoiceCommands() {
                                     }
 
                                     // Cancel any pending flush if user starts speaking again
-                                    if (pendingFlushTimeouts.has(userId)) {
-                                        clearTimeout(pendingFlushTimeouts.get(userId));
-                                        pendingFlushTimeouts.delete(userId);
+                                    if (pendingFlushTimeouts.has(key)) {
+                                        clearTimeout(pendingFlushTimeouts.get(key));
+                                        pendingFlushTimeouts.delete(key);
                                         // Only log this occasionally to reduce spam
                                         if (speakingEventCount % 25 === 0) {
                                             console.log(`[Voice] Cancelled pending flush for ${displayName}, still talking`);
@@ -1136,7 +1169,7 @@ async function pollVoiceCommands() {
                                     }
 
                                     // Check if user is muted - skip processing if they are
-                                    if (activePipelines.has(userId)) {
+                                    if (activePipelines.has(key)) {
                                         // Only log this occasionally to reduce spam
                                         if (speakingEventCount % 50 === 0) {
                                             console.log(`[Voice] Pipeline already active for ${displayName}, skipping`);
@@ -1153,15 +1186,13 @@ async function pollVoiceCommands() {
                                             return;
                                         }
 
-                                        activePipelines.add(userId);
+                                        activePipelines.set(key, opusStream);
                                         let chunkCount = 0;
 
                                         // Use prism-media's opus decoder instead of @discordjs/opus
                                         const pcmStream = opusStream.pipe(new prism.opus.Decoder({ channels: 2, rate: 48000 }));
-                                        const chunks = [];
-
                                         pcmStream.on('data', (chunk) => {
-                                            chunks.push(chunk);
+                                            if (deafenedGuilds.has(guildId) || voiceConnections.get(guildId) !== connection) return;
                                             chunkCount++;
                                             handleAudioChunk(guild.id, userId, chunk);
                                         });
@@ -1170,9 +1201,10 @@ async function pollVoiceCommands() {
                                             console.error(`[Voice] Opus decode error for ${displayName}:`, error);
                                         });
 
-                                        opusStream.on('end', () => {
+                                        opusStream.once('close', () => {
+                                            pcmStream.destroy();
                                             console.log(`[Voice] Dynamic stream ended for ${displayName} (total chunks: ${chunkCount})`);
-                                            activePipelines.delete(userId);
+                                            if (activePipelines.get(key) === opusStream) activePipelines.delete(key);
                                         });
                                     } catch (error) {
                                         console.error(`[Voice] Error dynamically subscribing to ${displayName}:`, error);
@@ -1180,6 +1212,8 @@ async function pollVoiceCommands() {
                                 });
 
                                 receiver.speaking.on('end', (userId) => {
+                                    const key = guildId + ':' + userId;
+                                    if (deafenedGuilds.has(guildId) || voiceChannel.members.get(userId)?.user.bot) return;
                                     const member = voiceChannel.members.get(userId);
                                     const displayName = member?.displayName || member?.user?.username || userId;
 
@@ -1194,9 +1228,9 @@ async function pollVoiceCommands() {
                                         return;
                                     }
 
-                                    if (pendingFlushTimeouts.has(userId)) {
-                                        clearTimeout(pendingFlushTimeouts.get(userId));
-                                        pendingFlushTimeouts.delete(userId);
+                                    if (pendingFlushTimeouts.has(key)) {
+                                        clearTimeout(pendingFlushTimeouts.get(key));
+                                        pendingFlushTimeouts.delete(key);
                                         // Only log this occasionally to reduce spam
                                         if (speakingEventCount % 25 === 0) {
                                             console.log(`[Voice] Cancelled pending flush for ${displayName}, still talking`);
@@ -1204,10 +1238,10 @@ async function pollVoiceCommands() {
                                     }
 
                                     const timeoutHandle = setTimeout(() => {
-                                        pendingFlushTimeouts.delete(userId);
+                                        pendingFlushTimeouts.delete(key);
                                         flushUserAudio(guild.id, userId);
                                     }, FLUSH_DEBOUNCE_MS);
-                                    pendingFlushTimeouts.set(userId, timeoutHandle);
+                                    pendingFlushTimeouts.set(key, timeoutHandle);
                                 });
 
                                 if (!await report(true)) throw new Error('Join result arrived after its deadline');
@@ -1217,6 +1251,9 @@ async function pollVoiceCommands() {
                                         await entersState(connection, VoiceConnectionStatus.Ready, 5000);
                                     } catch {
                                         if (voiceConnections.get(guildId) !== connection) return;
+                                        await stopTTSPlayback(guildId);
+                                        resetCapture(guildId, connection);
+                                        deafenedGuilds.delete(guildId);
                                         if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
                                         voiceConnections.delete(guildId);
                                         voiceChannels.delete(guildId);
@@ -1242,15 +1279,15 @@ async function pollVoiceCommands() {
                     } else if (command === 'leave') {
                         const connection = voiceConnections.get(guild.id);
                         if (connection) {
+                            await stopTTSPlayback(guildId);
+                            resetCapture(guildId, connection);
+                            deafenedGuilds.delete(guildId);
                             connection.destroy();
                             await notifyPythonVoiceStatus(guild.id, false);
                             voiceConnections.delete(guild.id);
                             audioPlayers.delete(guild.id);
                             audioBuffers.delete(guild.id);
                             voiceChannels.delete(guild.id);
-                            activePipelines.clear();
-                            pendingFlushTimeouts.forEach((handle) => clearTimeout(handle));
-                            pendingFlushTimeouts.clear();
                             console.log(`[Voice] Left voice channel in guild ${guildId}`);
                         }
                     } else if (command === 'replymode') {
@@ -1268,7 +1305,50 @@ async function pollVoiceCommands() {
     }
 }
 
-// Each guild can poll independently. Do not consume new text during playback.
+const actionPolls = new Set();
+async function pollVoiceActions(guildId, connection) {
+    if (actionPolls.has(guildId)) return;
+    actionPolls.add(guildId);
+    try {
+        const { data } = await axios.get(PYTHON_API_URL + '/voice/actions/' + guildId, {
+            params: { session_id: voiceSessionId }, timeout: 1800,
+        });
+        if (!data.action_id) return;
+        let outcome;
+        try {
+            if (voiceConnections.get(guildId) !== connection || connection.joinConfig.channelId !== data.channel_id) {
+                outcome = { error: true, detail: 'The voice channel changed.' };
+            } else if (data.action === 'deafen') {
+                const rejoined = connection.rejoin({ selfDeaf: data.deafened });
+                if (!rejoined) {
+                    outcome = { error: true, detail: 'Discord could not update the voice connection.' };
+                } else {
+                    if (data.deafened) {
+                        deafenedGuilds.add(guildId);
+                        resetCapture(guildId, connection);
+                    } else {
+                        deafenedGuilds.delete(guildId);
+                    }
+                    outcome = { detail: data.deafened ? 'Jenny stopped listening.' : 'Jenny is listening again.' };
+                }
+            } else {
+                outcome = { error: true, detail: 'Unknown voice action.' };
+            }
+        } catch (error) {
+            console.warn('[Voice] Voice action failed:', error.message);
+            outcome = { error: true, detail: 'Could not finish the voice action.' };
+        }
+        await axios.post(PYTHON_API_URL + '/voice/actions/' + data.action_id + '/result', {
+            ...outcome, guild_id: guildId, session_id: voiceSessionId,
+        }, { timeout: 1800 });
+    } catch (error) {
+        console.warn('[Voice] Voice action check failed:', error.message);
+    } finally {
+        actionPolls.delete(guildId);
+    }
+}
+
+// Each guild can poll independently. Do not consume new text during speech playback.
 const ttsPolls = new Set();
 async function pollGuildTTS(guildId) {
     const state = getTTSState(guildId);
@@ -1288,7 +1368,10 @@ async function pollGuildTTS(guildId) {
 
 setInterval(() => {
     for (const [guildId, connection] of voiceConnections) {
-        if (connection.state.status === VoiceConnectionStatus.Ready) void pollGuildTTS(guildId);
+        if (connection.state.status === VoiceConnectionStatus.Ready) {
+            void pollGuildTTS(guildId);
+            void pollVoiceActions(guildId, connection);
+        }
     }
 }, 1000);
 client.login(DISCORD_TOKEN);

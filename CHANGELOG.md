@@ -1,5 +1,28 @@
 # Jenny changelog
 
+## 0.95bf
+
+### Added
+
+- Added `/mute` for timed text, voice, or combined restrictions. Mutes expire automatically and survive restarts. Added `/timeout`, `/kick`, and `/ban` with permission and role hierarchy checks.
+- Added configurable ticket panels with private channels, per-button welcome messages and staff roles, plus reaction-role panels with an interactive role, color, and emoji picker. Published panels survive restarts.
+- Added opt-in `/freegames` alerts by platform, with optional DLC and loot, claim links, and Steam review summaries when available.
+- Added `/faq`, an animated `/coinflip`, and `/roll` for up to five dice.
+- Added `/deafen` to stop or resume listening in voice. The voice service ignores audio from other bots.
+- Added `/update` for release checks, plus supervised `/restart` and update installation for the owner of both the Discord server and Jenny application. Installation checks the official tag and requires a clean checkout that can fast-forward.
+
+### Improved
+
+- OpenRouter, Groq, Gemini, Tavily, and Deepgram now accept any number of numbered API keys. Legacy primary and backup settings still work. Chat, vision, maintenance, trivia, search, and speech use the eligible keys for their providers.
+- Live Whisper transcription can process one clip per Groq key in parallel. Queue limits discard stale clips during bursts.
+- Web searches handle follow-up answers with source links and report when there is no usable evidence. Voice timing reports go to chat.
+- The setup guide now explains Discord intents, role order, per-feature permissions, numbered keys, and the data that goes to external services.
+
+### Fixed
+
+- Fixed pagination callback collisions with Discord's UI refresh method.
+- Fixed the Windows launcher fallback to use Python 3.12 and stopped printing incoming message previews to the runtime log.
+
 ## 0.94bf
 
 - Added `/generatetrivia` for server administrators. Each request can save up to 100 new questions for one category and difficulty.

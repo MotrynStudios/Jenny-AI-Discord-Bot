@@ -25,7 +25,13 @@ def contains_control_text(text):
     ))
 
 
+SLASH_ONLY_COMMANDS = {"mute", "ban", "kick", "timeout", "ticketpanel", "reactionroles",
+                       "freegames", "restart", "update"}
+
+
 def command_allowed(command, actor, guild):
+    if command.name in SLASH_ONLY_COMMANDS:
+        return False
     if not guild:
         return command.name in DM_COMMANDS
     required = command.default_permissions
