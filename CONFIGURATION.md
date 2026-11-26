@@ -16,6 +16,7 @@ GROQ_API_KEY_5=another_key
 
 Jenny discovers every configured number at startup and tries the keys in numeric order. Gaps are fine. Blank and duplicate values are skipped. Existing unnumbered keys still work and take priority, and an existing `_BACKUP` key is tried after the numbered keys. Restart Python and the voice service after editing `.env`. A provider's keys all use the same configured model.
 
+Keys can share a provider quota. See [multiple API key support](README.md#multiple-api-key-support) for provider rules.
 
 | Setting | Required for | What to enter |
 | --- | --- | --- |

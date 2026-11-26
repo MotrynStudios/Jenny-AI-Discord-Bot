@@ -18,6 +18,7 @@ You only need to know how to copy API keys, create a Discord bot, and run a few 
   - [Installation and permissions](#installation-and-permissions)
   - [Role hierarchy](#role-hierarchy)
 - [API keys and free usage](#api-keys-and-free-usage)
+  - [Multiple API key support](#multiple-api-key-support)
 - [Configure the environment file](#configure-the-environment-file)
 - [Optional voice service](#optional-voice-service)
 - [Minecraft modpack data](#minecraft-modpack-data)
@@ -127,7 +128,7 @@ For example, with **Owner → Jenny → Helpers → Members**, Jenny can grant o
 
 ## API keys and free usage
 
-Start with one text provider. Extra keys give Jenny more routes when a provider is unavailable or hits its quota. Add as many extra keys as needed with numbered names such as `GROQ_API_KEY_2` or `TAVILY_API_KEY_3`. Keys from the same account or project can share a quota. Use only accounts and credentials you are authorized to use under each provider's terms.
+Start with one text provider. Add other providers as you enable features such as web search or voice.
 
 | Service | What Jenny uses it for | Get a key and check limits |
 | --- | --- | --- |
@@ -138,6 +139,12 @@ Start with one text provider. Extra keys give Jenny more routes when a provider 
 | Deepgram | Optional spoken responses | Create a project and API key in the [Deepgram console](https://console.deepgram.com/). Deepgram documents a [$200 starter credit](https://developers.deepgram.com/guides/fundamentals/make-your-first-api-request). Check [pricing](https://deepgram.com/pricing) and your project's [Flux TTS](https://developers.deepgram.com/docs/flux-tts/voices) access. Credit can run out. |
 
 You can run basic Jenny chat on a supported free tier without linking a credit card. Keep paid billing off and use the exact free model ID where a provider has separate paid and free routes. Check the linked dashboards for current limits and model availability. Optional voice uses Deepgram credits. You can skip a service if its terms or signup requirements do not work for you.
+
+### Multiple API key support
+
+Jenny accepts one or more API keys for Groq, OpenRouter, Gemini, Tavily, and Deepgram. Add numbered entries such as `GROQ_API_KEY_1` and `GROQ_API_KEY_2` to your `.env` for credential rotation and failover. Jenny has no fixed cap on how many keys you can configure. [Key setup](CONFIGURATION.md#credentials)
+
+**Provider limits still apply.** Use credentials you are authorized to use and follow each provider's terms, rate limits, and usage policies. Several keys can share the same quota. Jenny's multi-key support is for authorized credential management and availability. Do not create or combine accounts to bypass provider-imposed limits. [Groq acceptable use policy](https://console.groq.com/docs/legal/ai-policy) · [OpenRouter rate limits](https://openrouter.ai/docs/api/reference/limits)
 
 ## Configure the environment file
 
