@@ -11,12 +11,14 @@ import logging
 import os
 import re
 import threading
+from functools import lru_cache
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    import chromadb
+    from sentence_transformers import SentenceTransformer
 
 # Set up logging with absolute path
 script_dir = Path(__file__).resolve().parent
@@ -34,15 +36,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Default data locations, anchored to this script's folder rather than
-# whatever the current working directory happens to be when something
-# imports this module. Before this fix, Jenny-Bot.py (which lives in
-# Jenny/) and this file (which lives at the toolkit root) disagreed on
-# where "data/processed/all_documents.json" pointed to depending on which
-# folder the bot was launched from, so the RAG lookup silently found
-# nothing at runtime.
+# Keep generated paths relative to the installation, including CLI builds.
 DEFAULT_PROCESSED_DATA_PATH = script_dir / "data" / "processed" / "all_documents.json"
 DEFAULT_EMBEDDINGS_PATH = script_dir / "data" / "embeddings"
+_document_lock = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def _read_documents(path, revision):
+    with path.open(encoding="utf-8") as source:
+        documents = json.load(source)
+    if not isinstance(documents, list):
+        raise ValueError("Expected a list of processed pack documents")
+    return documents
+
+
+def load_pack_documents(path=DEFAULT_PROCESSED_DATA_PATH):
+    """Share a read-only corpus between lexical search and semantic retrieval."""
+    path = Path(path).resolve()
+    with _document_lock:
+        stat = path.stat()
+        return _read_documents(path, (stat.st_mtime_ns, stat.st_size))
 
 
 class JennyRAGSystem:
@@ -64,31 +78,17 @@ class JennyRAGSystem:
         """Load processed documents from JSON file"""
         logger.info("Loading documents for RAG...")
 
-        if not self.processed_data_path.exists():
-            logger.warning(f"Documents file not found: {self.processed_data_path}")
+        try:
+            self.documents = load_pack_documents(self.processed_data_path)
+        except (OSError, ValueError) as error:
+            logger.warning("Could not load pack documents: %s", error)
             return False
-
-        with open(self.processed_data_path, 'r', encoding='utf-8') as f:
-            self.documents = json.load(f)
 
         logger.info(f"Loaded {len(self.documents)} documents")
         return True
 
     def create_modpack_summary(self) -> str:
-        """Create a compact summary of the mod names in the indexed pack.
-        list of mod names in the pack.
-
-        Earlier versions repeated each mod's description (and before that,
-        item/block/feature samples) here too, but that's all still fully
-        indexed and searchable through get_rag_context() below, a mod's
-        own overview document (including its description) is exactly the
-        kind of thing a semantic search for "what does <mod> add" will
-        surface on its own. Keeping this list name-only means she still
-        always knows what mods exist in the pack (useful for quick
-        "is X in this pack" checks even when RAG doesn't fire), at a
-        fraction of the token cost of resending every description on
-        every single mod-related message.
-        """
+        """Build a roster for mod-list questions without sending every description."""
         logger.info("Creating modpack summary for Jenny...")
 
         # Prefer the extraction manifest because it represents the complete
@@ -133,6 +133,7 @@ class JennyRAGSystem:
         if self.embedding_model is not None:
             logger.info("Embedding model already initialized")
             return
+        from sentence_transformers import SentenceTransformer
         # SentenceTransformers/PyTorch otherwise create workers for every
         # logical CPU core. Keep indexing responsive on laptops without
         # changing the encoder, vectors, or retrieval quality.
@@ -163,18 +164,19 @@ class JennyRAGSystem:
             self.embedding_model = SentenceTransformer(model_id)
         logger.info("Embedding model initialized")
 
+    def _open_index(self):
+        if self.chroma_client is None:
+            import chromadb
+            from chromadb.config import Settings
+
+            self.embeddings_path.mkdir(parents=True, exist_ok=True)
+            self.chroma_client = chromadb.PersistentClient(str(self.embeddings_path),
+                                                          settings=Settings(anonymized_telemetry=False))
+        return self.chroma_client
+
     def initialize_vector_database(self):
-        """Initialize ChromaDB vector database"""
-        logger.info("Initializing vector database...")
-
-        # Create embeddings directory if it doesn't exist
-        self.embeddings_path.mkdir(parents=True, exist_ok=True)
-
-        # Initialize ChromaDB
-        self.chroma_client = chromadb.PersistentClient(
-            path=str(self.embeddings_path),
-            settings=Settings(anonymized_telemetry=False)
-        )
+        """Open the Chroma collection and rebuild it only when documents change."""
+        self._open_index()
 
         collection_name = "jenny_modpack_knowledge"
         if not self.documents:
@@ -294,7 +296,8 @@ class JennyRAGSystem:
         if self.collection is None:
             self.initialize_vector_database()
 
-        if self.collection is None or self.collection.count() == 0:
+        count = self.collection.count() if self.collection is not None else 0
+        if not count:
             return []
 
         if self.embedding_model is None:
@@ -308,7 +311,7 @@ class JennyRAGSystem:
         # Query collection
         if self.collection is None:
             raise RuntimeError("Collection not initialized")
-        candidate_count = min(max(24, top_k * 5), self.collection.count())
+        candidate_count = min(max(24, top_k * 5), count)
         results = self.collection.query(
             query_embeddings=question_embedding,
             n_results=candidate_count,
@@ -486,11 +489,7 @@ class JennyRAGSystem:
 
         # A previous index can remain usable without its source JSON. Avoid
         # downloading/loading the encoder if that persisted collection is empty.
-        self.embeddings_path.mkdir(parents=True, exist_ok=True)
-        self.chroma_client = chromadb.PersistentClient(
-            path=str(self.embeddings_path),
-            settings=Settings(anonymized_telemetry=False),
-        )
+        self._open_index()
         try:
             self.collection = self.chroma_client.get_collection(name="jenny_modpack_knowledge")
         except Exception:

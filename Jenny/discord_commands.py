@@ -1,14 +1,13 @@
 import asyncio
 import json
 import os
-import random
 import re
 from pathlib import Path
 import discord
 from discord import app_commands
 import requests
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Optional
 from database import (
     get_main_channel_id,
     clear_user_conversations,
@@ -19,10 +18,8 @@ from database import (
     set_logs_channel_id,
     get_setting,
     set_setting,
-    save_user_history,
     get_user_profile,
     get_user_profile_history,
-    get_all_user_profiles,
     get_recent_profile_changes,
     find_user_by_name,
     save_user_profile,
@@ -38,7 +35,6 @@ from database import (
     get_latest_command_output,
     set_command_output_page,
     record_trivia_game,
-    get_trivia_leaderboard,
     update_command_output,
 )
 from utils import sanitize_final_reply
@@ -55,16 +51,18 @@ import math
 # API configuration
 PYTHON_API_URL = "http://127.0.0.1:8000"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-from community_commands import register_community_commands
+from community_commands import README_URL, faq_pages, register_community_commands
 from timed_mutes import register_mute
 from panels import register_panels
-from free_games import register_free_games
+from free_games import enrich_giveaway_embed, register_free_games
 from voice_controls import register_voice_controls
 from operations import register_operations
+from language import register_language
+from leaderboards import period_start, register_leaderboards, show_leaderboard
+from welcome import register_welcome
+from command_runtime import MultiChoiceView
 
-DM_COMMANDS = {"faq", "coinflip", "roll", "help", "changelog", "health", "invite", "models", "mods", "modcontents", "trivia", "recipe", "searchpack", "mymemory", "forgetmydata", "myusage"}
-_PACK_DOCUMENTS_CACHE: list[dict[str, Any]] = []
-_PACK_DOCUMENTS_MTIME: Optional[int] = None
+DM_COMMANDS = {"faq", "coinflip", "roll", "freegamesnow", "help", "changelog", "health", "invite", "models", "mods", "modcontents", "trivia", "recipe", "searchpack", "mymemory", "myusage"}
 
 
 def make_notice_embed(content: str) -> discord.Embed:
@@ -132,13 +130,15 @@ def _output_conversation_id(user_id: int, guild_id: Optional[int], channel_id: i
 class PagedEmbedView(discord.ui.View):
     """A consistent Back/page/Next navigator for large command results."""
     def __init__(self, pages: list[discord.Embed], owner_id: int, page: int = 0,
-                 cache_id: Optional[int] = None, web_query=None):
+                 cache_id: Optional[int] = None, web_query=None, page_loader=None):
         super().__init__(timeout=600)
         self.pages = pages
         self.owner_id = owner_id
         self.page = max(0, min(page, len(pages) - 1))
         self.cache_id = cache_id
         self.web_query = web_query
+        self.page_loader = page_loader
+        self._page_revision = 0
         if web_query is None:
             self.remove_item(self.web_search)
         self._refresh_buttons()
@@ -162,9 +162,19 @@ class PagedEmbedView(discord.ui.View):
     async def show_page(self, interaction, page):
         self.page = max(0, min(len(self.pages) - 1, page))
         self._refresh_buttons()
+        shown = self.page
+        self._page_revision += 1
+        revision = self._page_revision
+        await interaction.response.edit_message(embed=self.pages[shown], view=self)
         if self.cache_id is not None:
-            set_command_output_page(self.cache_id, self.page)
-        await interaction.response.edit_message(embed=self.pages[self.page], view=self)
+            await asyncio.to_thread(set_command_output_page, self.cache_id, shown)
+        if await self.load_page(shown, interaction.guild) and revision == self._page_revision:
+            await interaction.edit_original_response(embed=self.pages[shown])
+
+    async def load_page(self, page, guild):
+        if self.page_loader:
+            return await self.page_loader(self.pages[page], guild)
+        return False
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -255,7 +265,9 @@ async def send_paged_interaction(interaction: discord.Interaction, pages: list[d
     """Send and cache a paginated embed so a later "more" can continue it."""
     if not pages:
         return
-    view = PagedEmbedView(pages, interaction.user.id, web_query=web_query)
+    page_loader = enrich_giveaway_embed if kind == "free_games" else None
+    view = PagedEmbedView(pages, interaction.user.id, web_query=web_query, page_loader=page_loader)
+    await view.load_page(0, interaction.guild)
     if interaction.response.is_done():
         sent = await interaction.followup.send(embed=pages[0], view=view, ephemeral=ephemeral, wait=True)
     else:
@@ -264,7 +276,8 @@ async def send_paged_interaction(interaction: discord.Interaction, pages: list[d
     context_id = _output_conversation_id(interaction.user.id,
                                          interaction.guild.id if interaction.guild else None,
                                          interaction.channel_id)
-    view.cache_id = save_command_output(
+    view.cache_id = await asyncio.to_thread(
+        save_command_output,
         str(interaction.user.id), str(interaction.guild.id) if interaction.guild else None,
         str(interaction.channel_id), context_id, kind, pages[0].title or kind,
         {"pages": [page.to_dict() for page in pages]}, str(sent.id),
@@ -364,33 +377,28 @@ def mod_content_pages(mod):
 
 def make_pack_search_pages(query: str) -> list[discord.Embed]:
     """Search every extracted document locally and return all matching pages."""
-    global _PACK_DOCUMENTS_CACHE, _PACK_DOCUMENTS_MTIME
-    documents_path = PROJECT_ROOT / "data" / "processed" / "all_documents.json"
+    from jenny_rag_integration import load_pack_documents
+
     try:
-        mtime = documents_path.stat().st_mtime_ns
-        if _PACK_DOCUMENTS_MTIME != mtime:
-            loaded = json.loads(documents_path.read_text(encoding="utf-8"))
-            _PACK_DOCUMENTS_CACHE = loaded if isinstance(loaded, list) else []
-            _PACK_DOCUMENTS_MTIME = mtime
-    except (OSError, json.JSONDecodeError) as error:
+        documents = load_pack_documents()
+    except (OSError, ValueError) as error:
         print(f"[PACK SEARCH] Could not load extracted documents: {error}")
         return []
 
     needle = query.strip().casefold()
     matches = []
-    for document in _PACK_DOCUMENTS_CACHE:
+    for document in documents:
         if not isinstance(document, dict):
             continue
         metadata = document.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
         body = str(document.get("text") or "")
-        searchable = " ".join(str(value) for value in metadata.values()) + " " + body
-        position = searchable.casefold().find(needle)
-        if position < 0:
-            continue
-        # Prefer the passage itself when the match is in its text; metadata
-        # matches still return a useful opening excerpt for that document.
-        body_pos = body.casefold().find(needle)
+        folded_body = body.casefold()
+        body_pos = folded_body.find(needle)
+        if body_pos < 0:
+            searchable = " ".join(str(value) for value in metadata.values()).casefold()
+            if needle not in searchable + " " + folded_body[:len(needle)]:
+                continue
         start = max(0, body_pos - 220) if body_pos >= 0 else 0
         excerpt = body[start:start + 700].strip()
         if start:
@@ -445,7 +453,7 @@ async def send_recipe_result(interaction: discord.Interaction, pages: list[disco
     context_id = _output_conversation_id(interaction.user.id,
                                          interaction.guild_id,
                                          interaction.channel_id)
-    save_command_output(str(interaction.user.id), str(interaction.guild_id) if interaction.guild_id else None,
+    await asyncio.to_thread(save_command_output, str(interaction.user.id), str(interaction.guild_id) if interaction.guild_id else None,
         str(interaction.channel_id), context_id, "recipe_search", "Recipe search",
         {"pages": [page.to_dict() for page in pages]}, None)
 
@@ -454,7 +462,7 @@ async def send_more_from_cache(message: discord.Message, user_id: str,
                                guild_id: Optional[str], conversation_id: str,
                                message_id: Optional[str] = None) -> bool:
     """Continue the latest cached multi-page result when the user asks for more."""
-    cached = get_latest_command_output(user_id, conversation_id, message_id=message_id)
+    cached = await asyncio.to_thread(get_latest_command_output, user_id, conversation_id, message_id=message_id)
     if not cached:
         return False
     payload = cached.get("payload") or {}
@@ -476,9 +484,11 @@ async def send_more_from_cache(message: discord.Message, user_id: str,
     embeds = [discord.Embed.from_dict(item) for item in pages]
     web_query = {"recipe_search": recipe_web_query, "mod_list": mod_web_query, "mod_contents": lambda embed: embed.title,
                  "pack_search": lambda embed: embed.title}.get(cached["kind"])
-    view = PagedEmbedView(embeds, message.author.id, page, int(cached["id"]), web_query)
+    page_loader = enrich_giveaway_embed if cached["kind"] == "free_games" else None
+    view = PagedEmbedView(embeds, message.author.id, page, int(cached["id"]), web_query, page_loader)
+    await view.load_page(page, message.guild)
     await message.reply(embed=embeds[page], view=view, mention_author=False)
-    set_command_output_page(int(cached["id"]), page)
+    await asyncio.to_thread(set_command_output_page, int(cached["id"]), page)
     return True
 
 
@@ -560,7 +570,7 @@ class ChangelogPageView(discord.ui.View):
                 lines.append("\n".join(batch))
             for index, text in enumerate(lines or ["No entries."]):
                 embed.add_field(name=title if index == 0 else f"{title} (continued)", value=text[:1024], inline=False)
-        embed.set_footer(text=f"{entry.get('type', 'release').title()} · {entry.get('date', 'date unavailable')}")
+        embed.set_footer(text=entry.get("type", "release").title())
         return embed
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
@@ -932,7 +942,7 @@ async def start_trivia_interaction(interaction, difficulty, rounds, mode, catego
         raise
 
 class ActivityPeriodView(discord.ui.View):
-    """Show one activity window at a time from three period buttons."""
+    """Show one activity window at a time, including all recorded activity."""
     def __init__(self, base_embed: discord.Embed, guild_id: int, owner_id: int,
                  user_id: Optional[int] = None):
         super().__init__(timeout=300)
@@ -947,16 +957,24 @@ class ActivityPeriodView(discord.ui.View):
             return False
         return True
 
-    async def show_period(self, interaction: discord.Interaction, days: int, label: str):
-        selected = {1: "activity:daily", 7: "activity:weekly", 30: "activity:monthly"}.get(days)
+    async def show_period(self, interaction: discord.Interaction, days: int | None, label: str):
+        await interaction.response.defer()
+        since = period_start(days)
+        guild_id = str(self.guild_id)
+        user_id = str(self.user_id) if self.user_id else None
+
+        def read_stats():
+            activity = get_server_activity_stats(guild_id, since, user_id)
+            connected = get_voice_session_time(guild_id, since, user_id)
+            tokens = get_token_usage(guild_id, user_id, since=since, limit=1) if user_id else []
+            services = get_service_usage(guild_id, user_id, since=since) if user_id else []
+            return activity, connected, tokens, services
+
+        activity, connected_ms, tokens, services = await asyncio.to_thread(read_stats)
+        selected = {1: "activity:daily", 7: "activity:weekly", 30: "activity:monthly", None: "activity:all-time"}[days]
         for child in self.children:
             if isinstance(child, discord.ui.Button) and child.custom_id and child.custom_id.startswith("activity:"):
                 child.style = discord.ButtonStyle.primary if child.custom_id == selected else discord.ButtonStyle.secondary
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        activity = get_server_activity_stats(str(self.guild_id), since,
-                                             str(self.user_id) if self.user_id else None)
-        connected_ms = get_voice_session_time(str(self.guild_id), since,
-                                              str(self.user_id) if self.user_id else None)
         embed = self.base_embed.copy()
         for index in reversed(range(len(embed.fields))):
             if embed.fields[index].name.startswith("Activity ·"):
@@ -969,8 +987,6 @@ class ActivityPeriodView(discord.ui.View):
                      f"{activity['voice_duration_ms'] / 60000:.1f} minutes of captured speech")
             embed.add_field(name=f"Activity · {label}", value=value, inline=False)
         else:
-            tokens = get_token_usage(str(self.guild_id), str(self.user_id), since=since, limit=1)
-            services = get_service_usage(str(self.guild_id), str(self.user_id), since=since)
             token_total = int(tokens[0]["total_tokens"] or 0) if tokens else 0
             speech = {str(row["service"]): int(row["duration_ms"] or 0) for row in services}
             value = (f"{activity['messages']:,} chat messages · {token_total:,} tokens\n"
@@ -978,8 +994,8 @@ class ActivityPeriodView(discord.ui.View):
                      f"{activity['voice_inputs']:,} voice inputs · {activity['voice_duration_ms'] / 60000:.1f} minutes captured speech\n"
                      f"STT {speech.get('stt', 0) / 60000:.1f} min · TTS {speech.get('tts', 0) / 60000:.1f} min")
             embed.add_field(name=f"Activity · {label}", value=value, inline=False)
-        embed.set_footer(text=f"Showing the last {label.lower()} · choose another period below")
-        await interaction.response.edit_message(embed=embed, view=self)
+        embed.set_footer(text=f"{label} · choose another period below")
+        await interaction.edit_original_response(embed=embed, view=self)
 
     @discord.ui.button(label="Daily", style=discord.ButtonStyle.secondary, custom_id="activity:daily")
     async def day_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -992,6 +1008,10 @@ class ActivityPeriodView(discord.ui.View):
     @discord.ui.button(label="Monthly", style=discord.ButtonStyle.secondary, custom_id="activity:monthly")
     async def month_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.show_period(interaction, 30, "Monthly")
+
+    @discord.ui.button(label="All time", style=discord.ButtonStyle.secondary, custom_id="activity:all-time")
+    async def lifetime_button(self, interaction, button):
+        await self.show_period(interaction, None, "All time")
 
 
 def setup_commands(bot):
@@ -1432,14 +1452,23 @@ def setup_commands(bot):
     @app_commands.choices(
         difficulty=[app_commands.Choice(name=label.title(), value=label) for label in ("easy", "medium", "hard")],
         mode=[app_commands.Choice(name="Solo", value="solo"), app_commands.Choice(name="Multiplayer", value="party")],
-        category=[app_commands.Choice(name="Mixed", value="mixed")] +
+        category=[app_commands.Choice(name="Mixed", value="mixed"), app_commands.Choice(name="Select categories", value="choose")] +
                  [app_commands.Choice(name=label, value=key) for key, label in CATEGORIES.items()],
     )
     async def trivia(interaction: discord.Interaction, difficulty: str = "medium",
                      rounds: app_commands.Range[int, 1, 20] = 5, mode: str = "party",
                      category: str = "mixed", seconds: app_commands.Range[int, 5, 120] = TRIVIA_DEFAULT_SECONDS):
-        await start_trivia_interaction(interaction, difficulty, rounds,
-                                       mode if interaction.guild_id else "solo", category, seconds)
+        if category != "choose":
+            return await start_trivia_interaction(interaction, difficulty, rounds,
+                                                 mode if interaction.guild_id else "solo", category, seconds)
+
+        async def chosen(component, categories):
+            await start_trivia_interaction(component, difficulty, rounds, mode if component.guild_id else "solo",
+                                           categories or "mixed", seconds)
+
+        await interaction.response.send_message(embed=discord.Embed(
+            title="Choose trivia categories", description="Pick the clues you want. Leave the selection empty for mixed trivia."),
+            view=MultiChoiceView(interaction.user.id, list(CATEGORIES.items()), "Choose categories", chosen), ephemeral=True)
 
     @tree.command(name="generatetrivia", description="Generate up to 100 extra questions for the shared trivia bank")
     @app_commands.guild_only()
@@ -1462,10 +1491,13 @@ def setup_commands(bot):
 
         async def generate_and_report():
             try:
-                added = await generate_extra_trivia(category, difficulty, count)
+                async with asyncio.timeout(52):
+                    added = await generate_extra_trivia(category, difficulty, count)
                 message = f"Added **{added}/{count}** new {difficulty} questions in **{CATEGORIES[category]}**."
                 if added < count:
                     message += "\nThe pack may have too few unused clues, or the model providers could not finish the batch."
+            except TimeoutError:
+                message = "Question generation timed out. Check Jenny's logs. Questions already saved are in the bank."
             except Exception as error:
                 print(f"[TRIVIA] Could not finish {category}/{difficulty} generation: {type(error).__name__}: {error}")
                 message = "I couldn't finish generating questions. Any questions already saved are still in the bank."
@@ -1485,21 +1517,7 @@ def setup_commands(bot):
 
     @tree.command(name="trivialeaderboard", description="Show the server's modpack trivia leaderboard")
     async def trivialeaderboard(interaction: discord.Interaction):
-        if not interaction.guild_id:
-            await interaction.response.send_message("Use the trivia leaderboard in a server.")
-            return
-        rows = get_trivia_leaderboard(str(interaction.guild_id), 500)
-        if not rows:
-            await interaction.response.send_message("No one has completed a multiplayer game yet.")
-            return
-        pages = []
-        for start in range(0, len(rows), 15):
-            group = rows[start:start + 15]
-            embed = discord.Embed(title="Modpack trivia leaderboard", color=discord.Color.gold())
-            embed.description = "\n".join(f"**{start + index + 1}.** {row['username']} · {row['points']} points · {row['games_won']} wins · {row['games_played']} games" for index, row in enumerate(group))
-            embed.set_footer(text=f"Players {start + 1}-{start + len(group)} of {len(rows)}")
-            pages.append(embed)
-        await send_paged_interaction(interaction, pages, "trivia_leaderboard", ephemeral=False)
+        await show_leaderboard(interaction, "Modpack trivia")
 
     @tree.command(name="replymode", description="Choose how Jenny answers messages sent in chat")
     @app_commands.describe(mode="For chat messages: reply in chat, voice, or both")
@@ -1555,30 +1573,17 @@ def setup_commands(bot):
             )
         await interaction.response.send_message(embed=embed)
 
-    @tree.command(name="forgetme", description="Wipe a specific user's conversation history with Jenny")
-    @app_commands.describe(user="Whose history with Jenny should be wiped")
+    @tree.command(description="Clear a member's saved conversation memory for this server")
+    @app_commands.describe(user="Member whose server-specific history and summary should be cleared")
     @app_commands.default_permissions(administrator=True)
-    async def forgetme(interaction: discord.Interaction, user: discord.Member):
-        # Check permissions manually
-        if not interaction.user.guild_permissions.administrator:
-            embed = discord.Embed(
-                title="❌ Permission Denied",
-                description="You need Administrator permissions to use this command.",
-                color=discord.Color.red()
-            )
-            await interaction.response.send_message(embed=embed)
-            return
-        
-        await interaction.response.defer()
-        
-        clear_user_conversations(str(user.id), str(interaction.guild.id) if interaction.guild else None)
-        
-        embed = discord.Embed(
-            title="🗑️ History Cleared",
-            description=f"Cleared {user.mention}'s conversation history with Jenny. Clean slate 🧹",
-            color=discord.Color.orange()
-        )
-        await interaction.edit_original_response(embed=embed)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def forget(interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await asyncio.to_thread(clear_user_conversations, str(user.id), str(interaction.guild_id))
+        await interaction.edit_original_response(embed=discord.Embed(
+            title="Server memory cleared", color=discord.Color.green(),
+            description=f"Cleared Jenny's saved conversation turns and server-specific summary for {user.mention}.",
+        ))
 
     @tree.command(name="mymemory", description="View Jenny's saved summary about you")
     async def mymemory(interaction: discord.Interaction):
@@ -1586,52 +1591,69 @@ def setup_commands(bot):
         summary = get_combined_user_summary(str(interaction.user.id), scope)
         embed = discord.Embed(title="Your saved Jenny memory", color=discord.Color.blurple())
         embed.description = summary[:4000] if summary else "Jenny has not saved a long-term summary about you yet."
-        embed.set_footer(text="Use /forgetmydata to clear your conversation memory and summary.")
+        embed.set_footer(text="A server administrator can use /forget to clear your server-specific memory.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @tree.command(name="forgetmydata", description="Clear your conversation memory and saved summary")
-    async def forgetmydata(interaction: discord.Interaction):
-        # Shared memory spans all of this user's Jenny conversations, so the
-        # self-service deletion command must clear every scope together.
-        clear_user_conversations(str(interaction.user.id))
-        if interaction.guild:
-            scope_label = "all your Jenny conversations, including this server and your DMs"
-        else:
-            scope_label = "all your Jenny conversations, including DMs and servers"
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="Your Jenny memory was cleared",
-                description=f"I cleared your saved conversation history and long-term memory for {scope_label}. Usage totals and audit logs are retained until their configured retention period expires.",
-                color=discord.Color.green(),
-            ),
-            ephemeral=False,
-        )
+    def visible_commands(interaction):
+        admin_only = {"assignrole", "removerole", "generatetrivia", "refreshprofiles",
+                      "setlogschannel", "setmainchannel", "setmodel", "tokenusage", "togglejenny", "voicetimes"}
+        for entry in tree.walk_commands():
+            if not isinstance(entry, app_commands.Command):
+                continue
+            permissions = entry.default_permissions or (entry.parent.default_permissions if entry.parent else None)
+            if interaction.guild:
+                member_permissions = interaction.user.guild_permissions
+                if permissions and not member_permissions.is_superset(permissions):
+                    continue
+                if entry.name in admin_only and not member_permissions.administrator:
+                    continue
+            elif entry.name not in DM_COMMANDS or entry.parent:
+                continue
+            yield entry
 
-    @tree.command(name="help", description="Show commands you can use and how to talk to Jenny")
-    async def help_command(interaction: discord.Interaction):
-        admin_only = {
-            "assignrole", "removerole", "forgetme", "generatetrivia", "refreshprofiles", "setlogschannel",
-            "setmainchannel", "setmodel", "tokenusage", "togglejenny", "voicetimes",
-        }
-        is_admin = bool(interaction.guild and interaction.user.guild_permissions.administrator)
-        visible_commands = [
-            f"`/{command.name}`" for command in tree.get_commands()
-            if (command.name not in admin_only or is_admin)
-            and (not command.default_permissions or (interaction.guild and
-                 interaction.user.guild_permissions.is_superset(command.default_permissions)))
-            and (interaction.guild is not None or command.name in DM_COMMANDS)
-        ]
-        embed = discord.Embed(title="Jenny's command guide", color=discord.Color.blurple())
-        embed.description = (
-            "In servers, Jenny replies when you say her name or mention her. DMs are direct conversations. "
-            "In voice, say her name or a common Whisper variation."
-        )
-        embed.add_field(name="Commands available to you", value=" · ".join(visible_commands)[:1024], inline=False)
-        embed.add_field(name="Modpack data", value="Put mod JARs in `mods/`, text configs in `config/`, then run `tools/rag/build_index.py`.", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=False)
+    @tree.command(name="help", description="See available Jenny commands or detailed help for one command")
+    @app_commands.describe(command="A command name, such as roll, recipe or activity leaderboard")
+    async def help_command(interaction: discord.Interaction, command: str | None = None):
+        can_use = list(visible_commands(interaction))
+        if not command:
+            embed = discord.Embed(title="Jenny's command guide", color=discord.Color.blurple(),
+                                  description="Use /help with a command name for its options and permissions.\n\n"
+                                  + " · ".join(f"`/{entry.qualified_name}`" for entry in can_use))
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        query = " ".join(command.strip().removeprefix("/").replace("_", " ").casefold().split())
+        selected = next((entry for entry in can_use if entry.qualified_name == query), None)
+        if selected is None:
+            await interaction.response.send_message(embed=make_notice_embed(
+                "I couldn't find a command with that name that you can use here."), ephemeral=True)
+            return
+        embed = discord.Embed(title=f"/{selected.qualified_name}", description=selected.description,
+                              color=discord.Color.blurple())
+        for option in selected.parameters:
+            status = "Required" if option.required else "Optional"
+            kind = option.type.name.replace("_", " ")
+            detail = f"{status} · {kind}"
+            if option.description and option.description != "…":
+                detail += "\n" + option.description
+            if not option.required and option.default is not None:
+                detail += f"\nDefault: {option.default}"
+            if option.choices:
+                detail += "\nChoices: " + ", ".join(choice.name for choice in option.choices)
+            if option.min_value is not None or option.max_value is not None:
+                detail += f"\nAllowed range: {option.min_value if option.min_value is not None else 'any'} to {option.max_value if option.max_value is not None else 'any'}"
+            embed.add_field(name=option.display_name, value=detail[:1024], inline=False)
+        if not selected.parameters:
+            embed.add_field(name="Options", value="Run the command by name. No additional options.", inline=False)
+        from model_commands import command_allowed
+        embed.set_footer(text="Also available by asking Jenny in chat." if command_allowed(
+            selected, interaction.user, interaction.guild) else "Use this as a slash command in Discord.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # `/help` is the single command guide; the old public `/jennyhelp` duplicated
-    # that content and exposed administrative commands to every member.
+    @help_command.autocomplete("command")
+    async def help_suggestions(interaction: discord.Interaction, current: str):
+        query = current.strip().removeprefix("/").casefold()
+        matching = [entry.qualified_name for entry in visible_commands(interaction) if query in entry.qualified_name]
+        return [app_commands.Choice(name=name, value=name) for name in matching[:25]]
 
     @tree.command(name="joinvc", description="Join the voice channel")
     async def joinvc(interaction: discord.Interaction):
@@ -2185,20 +2207,26 @@ def setup_commands(bot):
             self.service_rows = []
             self.page = 0
 
-        async def show_period(self, interaction: discord.Interaction, days: int, label: str):
+        async def show_period(self, interaction: discord.Interaction, days: int | None, label: str):
             if interaction.user.id != self.owner_id:
                 await interaction.response.send_message(embed=make_notice_embed("Only the person who opened this report can change its range."), ephemeral=False)
                 return
-            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-            selected_custom_id = f"usage:{label.lower()}"
+            since = period_start(days)
+            await interaction.response.defer(thinking=interaction.message is None)
+
+            def read_usage():
+                return (get_token_usage(self.guild_id, self.user_id, since=since, limit=1000),
+                        get_service_usage(self.guild_id, self.user_id, since=since))
+
+            token_rows, service_rows = await asyncio.to_thread(read_usage)
+            selected_custom_id = f"usage:{label.lower().replace(' ', '-')}"
             for child in self.children:
                 if isinstance(child, discord.ui.Button):
                     if child.custom_id and child.custom_id.startswith("usage:"):
                         child.style = (discord.ButtonStyle.primary if child.custom_id == selected_custom_id
                                        else discord.ButtonStyle.secondary)
             self.days, self.label, self.page = days, label, 0
-            self.token_rows = get_token_usage(self.guild_id, self.user_id, since=since, limit=1000)
-            self.service_rows = get_service_usage(self.guild_id, self.user_id, since=since)
+            self.token_rows, self.service_rows = token_rows, service_rows
             embed = self.make_embed()
             can_page = self.guild_id is not None and self.user_id is None and len(self.token_rows) > 15
             if not can_page:
@@ -2211,16 +2239,13 @@ def setup_commands(bot):
                     self.add_item(self.next_page)
                 self.previous_page.disabled = self.page <= 0
                 self.next_page.disabled = (self.page + 1) * 15 >= len(self.token_rows)
-            if interaction.message is not None:
-                await interaction.response.edit_message(embed=embed, view=self)
-            else:
-                await interaction.response.send_message(embed=embed, view=self, ephemeral=False)
+            await interaction.edit_original_response(embed=embed, view=self)
 
         def make_embed(self):
-            since = (datetime.now(timezone.utc) - timedelta(days=self.days)).date().isoformat()
+            since = period_start(self.days)[:10]
             heading = f"Usage for <@{self.user_id}>" if self.user_id else "Usage by member"
             embed = discord.Embed(title=f"{heading} · {self.label}", color=discord.Color.blurple())
-            embed.description = f"Activity since {since} UTC. Ranges use stored event timestamps."
+            embed.description = f"Activity since {since} UTC." if since else "All recorded activity."
             total = sum(int(row.get("total_tokens") or 0) for row in self.token_rows)
             prompt = sum(int(row.get("prompt_tokens") or 0) for row in self.token_rows)
             completion = sum(int(row.get("completion_tokens") or 0) for row in self.token_rows)
@@ -2270,6 +2295,10 @@ def setup_commands(bot):
         @discord.ui.button(label="Monthly", style=discord.ButtonStyle.secondary, custom_id="usage:monthly")
         async def monthly(self, interaction: discord.Interaction, button: discord.ui.Button):
             await self.show_period(interaction, 30, "Monthly")
+
+        @discord.ui.button(label="All time", style=discord.ButtonStyle.secondary, custom_id="usage:all-time")
+        async def lifetime(self, interaction, button):
+            await self.show_period(interaction, None, "All time")
 
     @tree.command(name="tokenusage", description="Show token and speech usage for this server")
     @app_commands.default_permissions(administrator=True)
@@ -2361,22 +2390,32 @@ def setup_commands(bot):
             await interaction.response.send_message(embed=embed)
             return
         
-        # Each release gets its own embed so the complete history remains readable.
-        changelog_entries = sorted(
-            changelog_entries,
-            key=lambda entry: tuple(int(part) for part in re.findall(r"\d+", entry["version"])),
-            reverse=True,
-        )
         view = ChangelogPageView(changelog_entries, interaction.user.id)
         await interaction.response.send_message(embed=view.make_embed(), view=view)
         view.message = await interaction.original_response()
 
-    register_community_commands(tree)
+    @tree.command(description="Browse answers to common Jenny questions")
+    async def faq(interaction: discord.Interaction):
+        try:
+            pages = faq_pages()
+        except (OSError, UnicodeError) as error:
+            print(f"[FAQ] Could not load README: {type(error).__name__}")
+            pages = []
+        if not pages:
+            await interaction.response.send_message(embed=make_notice_embed(
+                f"The local FAQ is unavailable. [Read the FAQ on GitHub]({README_URL}#faq)."))
+            return
+        await send_paged_interaction(interaction, pages, "faq")
+
+    register_community_commands(bot)
     register_mute(bot)
     register_panels(bot)
-    register_free_games(bot)
+    register_free_games(bot, send_paged_interaction)
     register_voice_controls(bot)
     register_operations(bot)
+    register_language(tree)
+    register_leaderboards(bot)
+    register_welcome(bot)
 
     # Explicit command contexts keep guild-only commands out of DMs and the
     # private command picker, instead of listing unusable commands there.
@@ -2387,31 +2426,3 @@ def setup_commands(bot):
             dm_channel=can_run_in_dm,
             private_channel=can_run_in_dm,
         )
-
-    @tree.error
-    async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-        cause = getattr(error, "original", error)
-        print(f"[COMMAND] /{interaction.command.name if interaction.command else 'unknown'} failed: {cause}")
-        if interaction.guild:
-            logs_id = get_logs_channel_id(str(interaction.guild.id))
-            log_channel = interaction.guild.get_channel(int(logs_id)) if logs_id else None
-            if isinstance(log_channel, (discord.TextChannel, discord.Thread)):
-                error_log = discord.Embed(
-                    title=f"Slash command failed: /{interaction.command.name if interaction.command else 'unknown'}",
-                    description=f"{type(cause).__name__}: {cause}"[:3500],
-                    color=discord.Color.red(), timestamp=discord.utils.utcnow())
-                error_log.add_field(name="Requested by", value=f"{interaction.user} ({interaction.user.id})", inline=False)
-                try:
-                    await log_channel.send(embed=error_log, allowed_mentions=discord.AllowedMentions.none())
-                except (discord.Forbidden, discord.HTTPException) as log_error:
-                    print(f"[LOGS] Could not post slash command failure to {log_channel.id}: {log_error}")
-        embed = discord.Embed(title="Command failed", description=str(cause)[:1000], color=discord.Color.red())
-        if isinstance(cause, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
-            embed.description = "A required Jenny service is offline or timed out. Start the voice/API service and try again."
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(embed=embed, ephemeral=False)
-            else:
-                await interaction.response.send_message(embed=embed, ephemeral=False)
-        except discord.HTTPException as response_error:
-            print(f"[COMMAND] Could not report command failure: {response_error}")

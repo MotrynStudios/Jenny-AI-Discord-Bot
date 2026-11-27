@@ -1,12 +1,15 @@
 """Cached recipe and autocomplete index over the current extracted pack."""
 
 import json
+import heapq
 import re
+import threading
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 
 DATA = Path(__file__).resolve().parents[1] / "data"
+_inventory_lock = threading.Lock()
 
 
 def read_json(path, default):
@@ -58,7 +61,8 @@ def inventory():
         revision = (DATA / "modpack_summary.json").stat().st_mtime_ns
     except OSError:
         revision = None
-    return _inventory(revision)
+    with _inventory_lock:
+        return _inventory(revision)
 
 
 def recipe_rows(value, source="", conditional=False):
@@ -132,14 +136,19 @@ def _inventory(revision):
                             "output": output, "inputs": inputs, "key": key, "pattern": pattern,
                             "used": set(resources(inputs))})
     outputs, ingredients = set(), set()
+    expanded_inputs = {}
     for recipe in recipes:
         outputs.update(recipe["outputs"])
-        expanded = set(recipe["used"])
-        pending = list(expanded)
-        while pending:
-            matches = tags.get(pending.pop(), set()) - expanded
-            expanded.update(matches)
-            pending.extend(matches)
+        key = frozenset(recipe["used"])
+        expanded = expanded_inputs.get(key)
+        if expanded is None:
+            expanded_set = set(key)
+            pending = list(key)
+            while pending:
+                matches = tags.get(pending.pop(), set()) - expanded_set
+                expanded_set.update(matches)
+                pending.extend(matches)
+            expanded = expanded_inputs[key] = frozenset(expanded_set)
         recipe["used"] = expanded
         ingredients.update(expanded)
     print(f"[PACK] Loaded {len(recipes)} recipes, {len(outputs)} outputs and {len(ingredients)} inputs")
@@ -174,10 +183,19 @@ def get_pack_context(question):
 def matching_choices(entries, query, limit=25):
     """Rank exact and prefix matches before substring matches."""
     query = query.strip().casefold().replace("_", " ")
-    scored = []
-    for value, name in entries:
-        candidates = (value.casefold().replace("_", " "), name.casefold())
-        if not query or any(query in candidate for candidate in candidates):
-            rank = 0 if query in candidates else 1 if any(candidate.startswith(query) for candidate in candidates) else 2
-            scored.append((rank, name.casefold(), value, name))
-    return [(value, name) for _, _, value, name in sorted(scored)[:limit]]
+
+    def scored():
+        for value, name in entries:
+            display = name.casefold()
+            identifier = value.casefold().replace("_", " ")
+            if query == identifier or query == display:
+                rank = 0
+            elif identifier.startswith(query) or display.startswith(query):
+                rank = 1
+            elif query in identifier or query in display:
+                rank = 2
+            else:
+                continue
+            yield rank, display, value, name
+
+    return [(value, name) for _, _, value, name in heapq.nsmallest(limit, scored())]

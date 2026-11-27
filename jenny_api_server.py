@@ -40,24 +40,19 @@ from utils import (
     contains_jenny_wake_word,
 )
 
-# Alias for backward compatibility
-_sanitize_final_reply = sanitize_final_reply
-
-# Import database
 from database import (
-    log_message, log_voice_chat, update_voice_chat_response, get_recent_voice_chat,
-    get_channel_memory, increment_message_count, get_conversation_history,
-    save_conversation_history, get_user_profile, get_user_profile_history,
-    format_user_profile_for_context, get_setting, set_setting,
+    log_voice_chat, update_voice_chat_response, get_recent_voice_chat,
+    get_channel_memory, get_conversation_history,
+    save_conversation_history, get_setting, set_setting,
     clear_conversation_history, get_main_channel_id, get_latest_image_context,
     get_recent_user_messages, record_service_usage, append_voice_turn_log,
     update_voice_chat_timings
 )
 
-# Import prompt builder for modular prompts
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Jenny'))
 from prompt_builder import build_voice_prompt, get_relevant_user_context
 from model_commands import contains_control_text, parse_model_command
+from language import language_code, language_instruction
+from audit_log import provider_audit
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -90,7 +85,7 @@ class VoiceResponse(BaseModel):
     timings_ms: Dict[str, int] = Field(default_factory=dict)
 
 class TTSRequest(BaseModel):
-    text: str
+    text: str = Field(max_length=12000)
     guild_id: str
     user_id: Optional[str] = None
 
@@ -151,11 +146,12 @@ def voice_service_is_online(max_age_seconds: int = 15) -> bool:
 
 
 def finalize_voice_turn(request: VoiceRequest, response: str,
-                        timings_ms: Optional[Dict[str, int]] = None) -> None:
+                        timings_ms: Optional[Dict[str, int]] = None, *, update_record: bool = True) -> None:
     """Persist response, timing data, and a private JSONL diagnostic record."""
     final_timings = {key: max(0, int(value or 0)) for key, value in (timings_ms or request.timings_ms).items()}
-    update_voice_chat_response(request.user_id, request.guild_id, request.transcript, response,
-                               final_timings, request.speech_duration_ms)
+    if update_record:
+        update_voice_chat_response(request.user_id, request.guild_id, request.transcript, response,
+                                   final_timings, request.speech_duration_ms)
     append_voice_turn_log({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "guild_id": request.guild_id,
@@ -222,6 +218,25 @@ async def health() -> Dict[str, Any]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
+@app.get("/voice/language/{guild_id}")
+async def voice_language(guild_id: str):
+    return {"language": language_code(guild_id)}
+
+
+class VoiceProviderIssue(BaseModel):
+    guild_id: str = Field(pattern=r"^\d{1,22}$")
+    service: str = Field(pattern=r"^(stt|tts)$")
+    code: str = Field(pattern=r"^[A-Za-z0-9_. -]{1,40}$")
+
+
+@app.post("/voice/providerissue")
+async def voice_provider_issue(issue: VoiceProviderIssue):
+    label = "Groq speech recognition" if issue.service == "stt" else "Deepgram speech synthesis"
+    description = "Rate limited (HTTP 429)." if issue.code == "429" else f"Voice provider failed: {issue.code}."
+    provider_audit(issue.guild_id, label, issue.service.upper(), description)
+    return {"status": "recorded"}
+
+
 @app.post("/voice/process")
 async def process_voice_input(request: VoiceRequest) -> VoiceResponse:
     """
@@ -238,13 +253,11 @@ async def process_voice_input(request: VoiceRequest) -> VoiceResponse:
     try:
         jenny_mentioned = contains_jenny_wake_word(request.transcript)
         # Log voice chat to database with empty response initially (will be updated if Jenny responds)
-        log_voice_chat(request.user_id, request.username, request.transcript, "", request.guild_id,
-                       request.channel_id, request.timings_ms, request.speech_duration_ms)
-        # Increment voice message count for memory maintenance
-        increment_message_count(request.guild_id, stream_type="voice")
+        await asyncio.to_thread(log_voice_chat, request.user_id, request.username, request.transcript, "", request.guild_id,
+                                request.channel_id, request.timings_ms, request.speech_duration_ms)
         
         if not jenny_mentioned or get_setting("jenny_enabled", "true", request.guild_id) == "false":
-            finalize_voice_turn(request, "", request.timings_ms)
+            await asyncio.to_thread(finalize_voice_turn, request, "", request.timings_ms, update_record=False)
             return VoiceResponse(response="", timestamp=datetime.now(timezone.utc).isoformat(),
                                  reply_mode="none")
         conversation_id = f"voice:{request.guild_id}:{request.channel_id or 'unknown'}"
@@ -302,6 +315,7 @@ async def process_voice_input(request: VoiceRequest) -> VoiceResponse:
             channel_summary=channel_summary,
             current_time=current_time
         )
+        messages.insert(-1, {"role": "system", "content": language_instruction(request.guild_id, spoken=True)})
         if command_context:
             messages.insert(-1, {"role": "system", "content": command_context})
         # Keep voice and text prompts aligned by providing the speaker's and
@@ -373,7 +387,7 @@ async def process_voice_input(request: VoiceRequest) -> VoiceResponse:
         # Generate response using Jenny's generate function
         ai_start = time.time()
         usage_context = {"user_id": request.user_id, "guild_id": request.guild_id}
-        response = await jenny_generate(messages, usage_context=usage_context)
+        response = await asyncio.wait_for(jenny_generate(messages, usage_context=usage_context), timeout=36) or ""
         ai_duration_ms = int((time.time() - ai_start) * 1000)
         voice_timings = {**request.timings_ms, "ai": ai_duration_ms}
         print(f"[{datetime.now(timezone.utc).isoformat()}] [Voice API] AI generation completed in {ai_duration_ms}ms")
@@ -408,7 +422,7 @@ async def process_voice_input(request: VoiceRequest) -> VoiceResponse:
             response = response.strip()
 
         # Sanitize final reply to remove any remaining NEED_SEARCH tags
-        response = _sanitize_final_reply(response)
+        response = sanitize_final_reply(response)
 
         # Extract corrected portion if AI self-corrected
         response = extract_corrected_response(response)
@@ -424,10 +438,10 @@ async def process_voice_input(request: VoiceRequest) -> VoiceResponse:
             {"role": "user", "content": f"{request.username}: {request.transcript}"},
             {"role": "assistant", "content": response},
         ])
-        save_conversation_history(conversation_id, request.user_id, request.username, user_history, limit=24)
+        await asyncio.to_thread(save_conversation_history, conversation_id, request.user_id, request.username, user_history, limit=24)
         
         # Log voice chat to database with response (update with actual response)
-        finalize_voice_turn(request, response, voice_timings)
+        await asyncio.to_thread(finalize_voice_turn, request, response, voice_timings)
         
         # Return response with status field
         total_time = (time.time() - start_time) * 1000
@@ -535,29 +549,24 @@ async def acknowledge_voice_action(action_id: str, result: VoiceActionResult):
 
 @app.post("/voice/tts")
 async def process_tts(request: TTSRequest) -> Dict[str, Any]:
-    """
-    Process TTS request from Jenny bot
-    """
+    """Queue text for the currently connected channel, with a short lifetime."""
     if not request.text.strip() or contains_control_text(request.text):
         raise HTTPException(status_code=422, detail="TTS accepts spoken text only.")
-    try:
-        tts_requests[request.guild_id] = {"text": request.text, "user_id": request.user_id}
-        
-        return {
-            "status": "success",
-            "text": request.text,
-            "guild_id": request.guild_id,
-            "message": "TTS request queued for voice service"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing TTS request: {str(e)}")
+    if not voice_service_is_online():
+        raise HTTPException(status_code=503, detail="The voice service is offline.")
+    channel_id = voice_connections.get(request.guild_id, {}).get("channel_id")
+    if not channel_id:
+        raise HTTPException(status_code=409, detail="Jenny is not connected to voice in this server.")
+    tts_requests[request.guild_id] = {"text": request.text, "user_id": request.user_id, "channel_id": channel_id,
+                                     "expires_at": time.monotonic() + 60}
+    return {"status": "success", "guild_id": request.guild_id}
 
 
 @app.post("/usage/service")
 async def record_service_usage_endpoint(request: ServiceUsageRequest) -> Dict[str, str]:
     if request.service.lower() not in {"stt", "tts"}:
         raise HTTPException(status_code=400, detail="service must be stt or tts")
-    record_service_usage(request.user_id, request.guild_id, request.service, request.duration_ms)
+    await asyncio.to_thread(record_service_usage, request.user_id, request.guild_id, request.service, request.duration_ms)
     return {"status": "recorded"}
 
 
@@ -579,13 +588,22 @@ async def voice_service_heartbeat(request: VoiceServiceHeartbeatRequest) -> Dict
         voice_connections.clear()
         voice_connections.update({guild_id: {"channel_id": channel_id}
                                   for guild_id, channel_id in request.connections.items()})
+    now = time.monotonic()
+    for pending in (voice_commands, tts_requests):
+        for guild_id in [key for key, item in pending.items() if item.get("expires_at", 0) <= now]:
+            pending.pop(guild_id, None)
+    for guild_id in [key for key, item in voice_join_attempts.items() if item["expires_at"] + 30 <= now]:
+        voice_join_attempts.pop(guild_id, None)
+    for guild_id in list(voice_text_channels):
+        if guild_id not in voice_connections and guild_id not in voice_join_attempts:
+            voice_text_channels.pop(guild_id, None)
     return {"status": "recorded", "voice_service_online": True}
 
 @app.post("/voice/turn/timing")
 async def update_voice_turn_timing(request: VoiceTurnTimingRequest) -> Dict[str, Any]:
     """Attach late Node-side measurements, including TTS generation/playback."""
-    update_voice_chat_timings(request.user_id, request.guild_id, request.transcript, request.timings_ms)
-    append_voice_turn_log({
+    await asyncio.to_thread(update_voice_chat_timings, request.user_id, request.guild_id, request.transcript, request.timings_ms)
+    await asyncio.to_thread(append_voice_turn_log, {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "guild_id": request.guild_id,
         "user_id": request.user_id,
@@ -598,16 +616,12 @@ async def update_voice_turn_timing(request: VoiceTurnTimingRequest) -> Dict[str,
 
 @app.get("/voice/tts/{guild_id}")
 async def get_tts_request(guild_id: str) -> Dict[str, Any]:
-    """
-    Get pending TTS request for a guild
-    """
-    if guild_id in tts_requests:
-        item = tts_requests.pop(guild_id)
-        if isinstance(item, str):
-            item = {"text": item, "user_id": None}
-        return {"status": "success", **item, "guild_id": guild_id}
-    else:
-        return {"status": "no_pending", "text": None, "guild_id": guild_id}
+    """Never play a pending reply after the service moves to a different channel."""
+    item = tts_requests.pop(guild_id, None)
+    if (item and item["expires_at"] > time.monotonic() and voice_service_is_online()
+            and item["channel_id"] == voice_connections.get(guild_id, {}).get("channel_id")):
+        return {"status": "success", "text": item["text"], "user_id": item["user_id"], "guild_id": guild_id}
+    return {"status": "no_pending", "text": None, "guild_id": guild_id}
 
 # Voice control endpoints
 @app.post("/voice/join")
@@ -675,6 +689,15 @@ async def leave_voice_channel(request: VoiceControlRequest) -> Dict[str, Any]:
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(status_code=500, detail=f"Error requesting voice leave: {str(e)}")
+
+@app.get("/voice/pending")
+async def get_pending_voice_guilds(session_id: str):
+    """One idle poll for the service, with a claim only when a guild is ready."""
+    if session_id != voice_service_session_id or not voice_service_is_online():
+        return {"guild_ids": []}
+    now = time.monotonic()
+    return {"guild_ids": [guild_id for guild_id, command in voice_commands.items() if command["expires_at"] > now]}
+
 
 @app.get("/voice/command/{guild_id}")
 async def get_voice_command(guild_id: str, session_id: Optional[str] = None) -> Dict[str, Any]:

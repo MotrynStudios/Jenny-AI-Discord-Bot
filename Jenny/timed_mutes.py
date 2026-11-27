@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from community_commands import result
+from community_commands import MAX_TIMEOUT_PERIOD, parse_period, result
 from database import get_setting, set_setting
 
 
@@ -109,13 +109,14 @@ async def release(bot, guild, state, member_id, reason, member=None):
                 target = None
         if target:
             # Use fresh overwrites so an immediate unmute cannot restore stale values.
-            channels = {str(channel.id): channel for channel in await guild.fetch_channels()}
             for channel_id, prior in entry["overwrites"].items():
-                channel = channels.get(channel_id)
-                if channel:
-                    current = channel.overwrites_for(target)
-                    restore = {name: value for name, value in prior.items() if getattr(current, name) is False}
-                    await write_flags(channel, target, restore, reason)
+                try:
+                    channel = await guild.fetch_channel(int(channel_id))
+                except (discord.NotFound, discord.InvalidData):
+                    continue
+                current = channel.overwrites_for(target)
+                restore = {name: value for name, value in prior.items() if getattr(current, name) is False}
+                await write_flags(channel, target, restore, reason)
     del state["members"][member_id]
     await save_state(guild, state)
 
@@ -188,11 +189,12 @@ def register_mute(bot):
             except (discord.HTTPException, ValueError) as error:
                 LOGGER.warning("Could not restore timed mute in guild %s: %s", guild.id, type(error).__name__)
 
-    @bot.tree.command(description="Mute text, voice or both for a number of minutes. Use zero to unmute.")
+    @bot.tree.command(description="Mute text, voice or both for a period, or remove a mute")
     @app_commands.default_permissions(manage_roles=True, moderate_members=True)
+    @app_commands.describe(period="Mute length, such as 30m, 2h, 3d, or 1w. Use 0 to unmute.")
     @app_commands.choices(mode=[app_commands.Choice(name=name.title(), value=name) for name in ROLE_NAMES])
     async def mute(interaction: discord.Interaction, member: discord.Member,
-                   minutes: app_commands.Range[int, 0, 40320],
+                   period: app_commands.Range[str, 1, 16],
                    mode: str = "both", reason: app_commands.Range[str, 0, 350] = ""):
         guild, actor = interaction.guild, interaction.user
         perms = interaction.permissions
@@ -206,6 +208,10 @@ def register_mute(bot):
                 or guild.me.top_role <= member.top_role):
             return await result(interaction, "Mute unavailable", "Check the selected member and the server role order.", error=True)
 
+        try:
+            seconds = parse_period(period, maximum=MAX_TIMEOUT_PERIOD)
+        except ValueError as error:
+            return await result(interaction, "Invalid period", str(error), error=True)
         await interaction.response.defer(thinking=True)
         audit = f"{actor} ({actor.id}): {reason or 'Jenny timed mute'}"[:512]
         member_id = str(member.id)
@@ -213,7 +219,7 @@ def register_mute(bot):
             state = await load_state(guild)
             active = state["members"].get(member_id)
             try:
-                if not minutes:
+                if not seconds:
                     if not active:
                         return await result(interaction, "No active mute", "Jenny has no timed mute for that member.")
                     await release(bot, guild, state, member_id, audit, member)
@@ -229,7 +235,7 @@ def register_mute(bot):
                 await save_state(guild, state)
                 await enforce(guild, state, member, role, entry, permission_scopes(guild), audit)
                 await member.add_roles(role, reason=audit)
-                entry["expires"] = int(time.time()) + minutes * 60
+                entry["expires"] = int(time.time()) + seconds
                 await save_state(guild, state)
             except ValueError as error:
                 return await result(interaction, "Mute unavailable", str(error), error=True)

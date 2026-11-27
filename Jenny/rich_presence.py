@@ -11,6 +11,7 @@ import time
 from typing import TYPE_CHECKING
 
 import discord
+from aiohttp import ClientConnectionError
 
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
@@ -43,7 +44,7 @@ async def run_minecraft_presence(bot: "Bot") -> None:
         )
         try:
             await bot.change_presence(activity=activity)
-        except (discord.HTTPException, discord.DiscordException):
+        except (discord.HTTPException, discord.DiscordException, ClientConnectionError, OSError):
             # Presence is cosmetic; a transient gateway/API failure should not
             # take down message handling or add noise to the runtime log.
             pass

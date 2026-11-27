@@ -20,10 +20,10 @@ _MODPACK_FOLLOW_UP = re.compile(
     re.IGNORECASE,
 )
 _JENNY_WAKE_WORD = re.compile(
-    r"\b(?:jenny(?:\s*belle)?|jenni|jennie|jeni|chani|china|shani|sha[a]?ni|jennybell)\b",
+    r"\b(?:jenny(?:\s*belle)?|jenni|jennie|jeni|chani|china|shani|sha[a]?ni|jennybell|جيني|дженни)\b|珍妮|ジェニー|제니",
     re.IGNORECASE,
 )
-_JENNY_TEXT_NAME = re.compile(r"\b(?:jenny(?:\s+belle)?|jennybell)\b", re.IGNORECASE)
+_JENNY_TEXT_NAME = re.compile(r"\b(?:jenny(?:\s+belle)?|jennybell|جيني|дженни)\b|珍妮|ジェニー|제니", re.IGNORECASE)
 
 # Pattern for detecting NEED_SEARCH commands
 NEED_SEARCH_PATTERN: re.Pattern = re.compile(r"NEED_SEARCH\s*:\s*(.+)", re.IGNORECASE)

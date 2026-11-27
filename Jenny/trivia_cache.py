@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import random
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 DATABASE_PATH = Path(__file__).resolve().parent.parent / "data" / "trivia_cache.sqlite3"
 
@@ -13,8 +11,18 @@ DATABASE_PATH = Path(__file__).resolve().parent.parent / "data" / "trivia_cache.
 @contextmanager
 def _connect(path=DATABASE_PATH):
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=15)
-    connection.row_factory = sqlite3.Row
+    with closing(sqlite3.connect(path, timeout=15)) as connection, connection:
+        connection.row_factory = sqlite3.Row
+        if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+                _initialize_schema(connection)
+                connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+        yield connection
+
+
+def _initialize_schema(connection):
     connection.execute("""
         CREATE TABLE IF NOT EXISTS trivia_questions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,22 +46,12 @@ def _connect(path=DATABASE_PATH):
     # Keep old solve IDs intact while isolating the new typed questions.
     columns = {row[1] for row in connection.execute("PRAGMA table_info(trivia_questions)")}
     if "fact_key" not in columns:
-        connection.execute("BEGIN IMMEDIATE")
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(trivia_questions)")}
-        if "fact_key" not in columns:
-            connection.execute("ALTER TABLE trivia_questions ADD COLUMN fact_key TEXT")
-            connection.execute("ALTER TABLE trivia_questions ADD COLUMN category TEXT")
+        connection.execute("ALTER TABLE trivia_questions ADD COLUMN fact_key TEXT")
+    if "category" not in columns:
+        connection.execute("ALTER TABLE trivia_questions ADD COLUMN category TEXT")
     connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS trivia_source_difficulty
                           ON trivia_questions(category, difficulty, fact_key) WHERE fact_key IS NOT NULL""")
-    connection.commit()
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_trivia_solves_guild ON trivia_solves(guild_id)")
 
 
 def add_questions(rows: list[dict[str, str]], path=DATABASE_PATH) -> int:

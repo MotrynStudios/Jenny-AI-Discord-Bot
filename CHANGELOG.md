@@ -1,5 +1,31 @@
 # Jenny changelog
 
+## 0.96bf
+
+Ticket and role tools, giveaway ratings and stock updates, server activity reports, and more reliable voice and chat context.
+
+### Added
+
+- Added `/joinrole` for new members, editable ticket and reaction-role drafts, and `/copyembed` for published panels. Supports per-button colors, emoji, insertion order, and optional ticket commands.
+- Added single-claim tickets and restricted closing to assigned staff and administrators. Jenny saves the transcript locally before deleting the ticket channel.
+- Added customizable welcome embeds with member avatars or uploaded art, channel placeholders, and a preview command. Saved welcome templates and published panels can be copied to the logs channel.
+- Added paged activity, invite, and trivia leaderboards with period and mode controls. Added `/help command:` and an All time period for usage and activity reports.
+- Added free-game platform multiselect, in-card role pings, and separate add-on delivery. Full games use platform or general game roles. Add-ons use their own role, and `/myaddons` filters the list by your platform roles.
+- Giveaway cards show direct claim links when available, large artwork, a small store or platform badge, and verified product ratings from Steam, GOG, Google Play, and the App Store. Cards also update in place when an offer ends or its published stock changes.
+
+### Improved
+
+- Voice transcriptions run in parallel and replies queue per server. `/language` controls chat and transcription language. Jenny filters emoji and non-Latin text before English speech synthesis and checkpoints connected voice time.
+- Recent embeds and exact replies receive priority in chat context. Jenny describes images before answering and keeps raw message history while trimming what goes to the model.
+- Runtime logs are timestamped and archived separately for Python and voice. Discord audit logs focus on admin actions, panel changes, and actionable failures. `/changelog` reads the same release notes as GitHub and includes older releases on a fresh installation.
+- Reduced repeat work in pack lookups and memory maintenance, and bounded voice queues and caches to limit resource use.
+
+### Fixed
+
+- Tickets open without fetching every channel type, slow commands return errors, welcome channel IDs resolve in braces, and invalid emoji no longer prevent saving a button.
+- Added shorthand periods to `/ban`, `/timeout`, and `/mute`, and fixed dice layouts for wider rolls.
+- Replaced `/forgetme` and `/forgetmydata` with the administrator-only, server-scoped `/forget` command.
+
 ## 0.95bf
 
 ### Added

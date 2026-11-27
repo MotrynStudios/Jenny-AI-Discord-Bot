@@ -227,10 +227,11 @@ async def seed_trivia_bank(root):
 
 
 async def make_pack_trivia(difficulty="medium", rounds=5, category="mixed", *, exclude=()):
-    if difficulty not in DIFFICULTIES or category not in {"mixed", *CATEGORIES}:
+    categories = list(CATEGORIES) if category == "mixed" else [category] if isinstance(category, str) else list(category)
+    categories = list(dict.fromkeys(categories))
+    if difficulty not in DIFFICULTIES or not categories or any(kind not in CATEGORIES for kind in categories):
         raise ValueError("Choose a valid trivia category and difficulty.")
     corpus = await asyncio.to_thread(load_facts)
-    categories = list(CATEGORIES) if category == "mixed" else [category]
     pools = {}
     for kind in categories:
         answers = {row["answer"] for row in corpus[kind].values()}

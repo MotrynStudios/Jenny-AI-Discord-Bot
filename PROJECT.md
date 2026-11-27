@@ -24,7 +24,14 @@ This guide covers the public source files. Generated data is listed separately.
 | [`Jenny/community_commands.py`](Jenny/community_commands.py) | Ban, kick, timeout, FAQ, coin flip, and dice commands. |
 | [`Jenny/timed_mutes.py`](Jenny/timed_mutes.py) | Persistent text and voice mute roles, channel overrides, and expiration. |
 | [`Jenny/panels.py`](Jenny/panels.py) | Persistent ticket panels and self-assignable role buttons. |
-| [`Jenny/free_games.py`](Jenny/free_games.py) | Free-game subscriptions, GamerPower alerts, and optional Steam reviews. |
+| [`Jenny/discord_format.py`](Jenny/discord_format.py) | Shared emoji shorthand, custom emoji, and embed color parsing. |
+| [`Jenny/welcome.py`](Jenny/welcome.py) | Welcome templates, member join embeds, and local image upload handling. |
+| [`Jenny/leaderboards.py`](Jenny/leaderboards.py) | Activity, trivia and invite rankings, and invite attribution. |
+| [`Jenny/language.py`](Jenny/language.py) | Server language setting for chat and transcription. |
+| [`Jenny/command_runtime.py`](Jenny/command_runtime.py) | Command deadlines and multi-select filters. |
+| [`Jenny/audit_log.py`](Jenny/audit_log.py) | Server audit embeds and deduplicated model failure reports. |
+| [`Jenny/free_games.py`](Jenny/free_games.py) | Scheduled giveaway cards, stock and expiry updates, store badges, private add-on filters, and the Epic feed fallback. |
+| [`Jenny/giveaway_ratings.py`](Jenny/giveaway_ratings.py) | Bounded lookup and caching of exact-product ratings from supported storefronts. |
 | [`Jenny/operations.py`](Jenny/operations.py) | Owner checks and Discord commands for supervised restarts and releases. |
 | [`Jenny/release_update.py`](Jenny/release_update.py) | GitHub release lookup and checks for a verified fast-forward installation. |
 | [`Jenny/voice_controls.py`](Jenny/voice_controls.py) | The Discord command for pausing or resuming live voice capture. |
@@ -35,7 +42,7 @@ This guide covers the public source files. Generated data is listed separately.
 | [`Jenny/database.py`](Jenny/database.py) | SQLite schema, migrations, history, summaries, profiles, guild settings, usage, activity and cached results. |
 | [`Jenny/memory_maintenance.py`](Jenny/memory_maintenance.py) | Reads eligible conversation records, validates summary responses and saves progress. |
 | [`Jenny/rich_presence.py`](Jenny/rich_presence.py) | Updates Jenny's Minecraft Playing activity and elapsed process time. |
-| [`Jenny/runtime_logging.py`](Jenny/runtime_logging.py) | Mirrors stdout and stderr into a rotating Python log. |
+| [`Jenny/runtime_logging.py`](Jenny/runtime_logging.py) | Timestamps Python stdout and stderr and archives the previous log on startup. |
 | [`Jenny/utils.py`](Jenny/utils.py) | Jenny name recognition, modpack query hints and reply cleanup. |
 | [`jenny_api_server.py`](jenny_api_server.py) | FastAPI loopback interface for voice operations, transcripts, health and timing records. |
 | [`jenny_rag_integration.py`](jenny_rag_integration.py) | Loads the local corpus, embeddings and Chroma index, then retrieves relevant pack evidence. |
@@ -44,9 +51,10 @@ This guide covers the public source files. Generated data is listed separately.
 
 | File | Responsibility |
 | --- | --- |
-| [`voice_service/index.js`](voice_service/index.js) | Discord voice connection, speech capture, Whisper transcription, the Python bridge, Flux synthesis and playback. |
+| [`voice_service/index.js`](voice_service/index.js) | Discord voice connection, speech capture, Whisper transcription, pending bridge commands, and streamed Flux playback. |
 | [`voice_service/provider_keys.js`](voice_service/provider_keys.js) | Discovers numbered and legacy credentials for Node providers. |
 | [`voice_service/transcription_queue.js`](voice_service/transcription_queue.js) | Schedules STT clips across keys and drops stale work. |
+| [`voice_service/runtime_logging.js`](voice_service/runtime_logging.js) | Timestamps and archives each Node voice log session. |
 | [`voice_service/package.json`](voice_service/package.json) | Node version requirement, launch scripts and direct dependencies. |
 | [`voice_service/package-lock.json`](voice_service/package-lock.json) | Resolved dependency tree used by `npm ci`. Regenerate it with npm when dependencies change. |
 | [`tools/rag/build_index.py`](tools/rag/build_index.py) | Runs the extraction, document processing and vector index stages. |

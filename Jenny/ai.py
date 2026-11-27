@@ -204,7 +204,9 @@ def _model_ready(client, model):
     return bool(model) and not _is_model_in_cooldown(f"{client.name}:{model}")
 
 
-def _provider_error(client, model, label, error):
+def _provider_error(client, model, label, error, usage_context=None):
+    from audit_log import provider_audit
+
     if isinstance(error, RateLimitError):
         retry_after = error.response.headers.get("retry-after")
         try:
@@ -215,11 +217,14 @@ def _provider_error(client, model, label, error):
             seconds = float(delay[1]) if delay else minutes * 60 if minutes else 60
         seconds = max(1, min(seconds, 86400))
         _set_model_cooldown(f"{client.name}:{model}", seconds / 60)
+        detail = f"Rate limited. Retrying another route; cooldown {seconds:.0f}s."
         print(f"[AI] {label} ({model}) rate limited for {seconds:.0f}s; trying next provider")
     else:
         status = getattr(error, "status_code", None)
         detail = f"HTTP {status}" if status else type(error).__name__
         print(f"[AI] {label} ({model}) failed: {detail}")
+    if usage_context:
+        provider_audit(usage_context.get("guild_id"), label, model, detail)
 
 
 def _set_model_cooldown(model_name: str, cooldown_minutes: Optional[int] = None) -> None:
@@ -350,7 +355,7 @@ async def generate(messages: List[Dict[str, str]], usage_context: Optional[Mappi
                 print(f"[AI] {label} ({model}) generated a response")
                 return _clean_reply(content)
         except Exception as error:
-            _provider_error(client, model, label, error)
+            _provider_error(client, model, label, error, usage_context)
     return "my brain's completely fried right now, try again in a bit?"
 
 
@@ -405,7 +410,7 @@ async def generate_memory_maintenance(messages: List[Dict[str, str]],
             print(f"[AI] {label} ({model}) generated a valid memory update")
             return json.dumps(payload, ensure_ascii=False)
         except Exception as error:
-            _provider_error(client, model, label, error)
+            _provider_error(client, model, label, error, usage_context)
     return "{}"
 
 
@@ -523,7 +528,7 @@ async def analyze_image(image_url: str, hint: str = "", usage_context: Optional[
                 continue
             return description
         except Exception as error:
-            _provider_error(client, model, f"{label} vision", error)
+            _provider_error(client, model, f"{label} vision", error, usage_context)
 
     print("[AI] All vision models failed or refused")
     return None
@@ -534,7 +539,10 @@ async def transcribe_audio_attachment(data: bytes, filename: str, content_type: 
     """Transcribe a Discord voice attachment through the configured Groq keys."""
     if not data:
         return None
+    from language import language_code
+
     mime = content_type or "audio/ogg"
+    selected_language = language_code(usage_context.get("guild_id") if usage_context else None)
     for client, model, label in _model_routes((_GROQ_STT,)):
         if not _model_ready(client, model):
             continue
@@ -544,6 +552,7 @@ async def transcribe_audio_attachment(data: bytes, filename: str, content_type: 
                 model=model,
                 file=(filename, data, mime),
                 response_format="text",
+                language=selected_language,
             )
             transcript = result if isinstance(result, str) else getattr(result, "text", "")
             elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -556,13 +565,13 @@ async def transcribe_audio_attachment(data: bytes, filename: str, content_type: 
             if transcript:
                 return str(transcript).strip()
         except Exception as error:
-            _provider_error(client, model, f"{label} transcription", error)
+            _provider_error(client, model, f"{label} transcription", error, usage_context)
     return None
 
 
 async def _prepare_image_items(image_url: str) -> List[Dict[str, Any]]:
     """Prepare image URLs for vision; animated images become ordered sampled frames."""
-    def download() -> Optional[tuple[bytes, str]]:
+    def download() -> Optional[tuple[bytearray, str]]:
         # Only fetch Discord uploads/previews and known GIF CDN hosts. Validate
         # each redirect separately so a crafted link cannot reach local/private
         # services through an open redirect.
@@ -575,62 +584,50 @@ async def _prepare_image_items(image_url: str) -> List[Dict[str, Any]]:
                 if parsed.scheme != "https" or not any(host == suffix or host.endswith("." + suffix) for suffix in allowed_hosts):
                     print(f"[Vision] Rejected image URL outside trusted media hosts: {host or 'invalid URL'}")
                     return None
-                response = requests.get(current_url, timeout=15, stream=True, allow_redirects=False)
-                if response.is_redirect:
-                    location = response.headers.get("location")
-                    response.close()
-                    if not location:
-                        return None
-                    current_url = urljoin(current_url, location)
-                    continue
-                response.raise_for_status()
-                size = 0
-                chunks = []
-                for chunk in response.iter_content(64 * 1024):
-                    if not chunk:
+                with requests.get(current_url, timeout=(3, 10), stream=True, allow_redirects=False) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            return None
+                        current_url = urljoin(current_url, location)
                         continue
-                    size += len(chunk)
-                    if size > 20 * 1024 * 1024:
-                        response.close()
-                        return None
-                    chunks.append(chunk)
-                content_type = response.headers.get("content-type", "")
-                response.close()
-                return b"".join(chunks), content_type
+                    response.raise_for_status()
+                    payload = bytearray()
+                    for chunk in response.iter_content(64 * 1024):
+                        if len(payload) + len(chunk) > 20 * 1024 * 1024:
+                            return None
+                        payload.extend(chunk)
+                    return payload, response.headers.get("content-type", "")
             print("[Vision] Image URL exceeded the safe redirect limit")
             return None
         except requests.RequestException as error:
-            print(f"[Vision] Could not load image: {error}")
+            print(f"[Vision] Could not load image: {type(error).__name__}")
             return None
 
-    downloaded = await asyncio.to_thread(download)
-    if not downloaded:
-        return []
-    payload, content_type = downloaded
-    try:
-        from PIL import Image, ImageSequence
-        image = Image.open(io.BytesIO(payload))
-        frame_count = int(getattr(image, "n_frames", 1))
-        if frame_count > 1:
-            # Sample evenly across the complete animation so motion and
-            # before/after changes are visible without sending every frame.
-            # Current default Groq vision model accepts at most three images
-            # per request, so keep animation sampling within that limit.
-            sample_count = min(3, frame_count)
-            indexes = sorted({round(i * (frame_count - 1) / max(1, sample_count - 1)) for i in range(sample_count)})
-            items = []
-            for index in indexes:
-                image.seek(index)
-                frame = image.convert("RGB")
-                frame.thumbnail((768, 768))
-                output = io.BytesIO()
-                frame.save(output, format="JPEG", quality=82, optimize=True)
-                encoded = base64.b64encode(output.getvalue()).decode("ascii")
-                items.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
-                })
-            return [{"type": "text", "text": f"The following {len(items)} images are ordered samples from an animated image."}, *items]
-    except Exception as error:
-        print(f"[Vision] Animation sampling unavailable ({content_type}): {error}")
-    return [{"type": "image_url", "image_url": {"url": image_url}}]
+    def prepare():
+        downloaded = download()
+        if not downloaded:
+            return []
+        payload, content_type = downloaded
+        from PIL import Image
+
+        try:
+            with io.BytesIO(payload) as source, Image.open(source) as image:
+                frame_count = int(getattr(image, "n_frames", 1))
+                if frame_count > 1:
+                    # Keep the start, middle, and end without exceeding the vision model's image limit.
+                    indexes = sorted({0, (frame_count - 1) // 2, frame_count - 1})
+                    items = [{"type": "text", "text": f"The following {len(indexes)} images are ordered samples from an animated image."}]
+                    for index in indexes:
+                        image.seek(index)
+                        with image.convert("RGB") as frame, io.BytesIO() as output:
+                            frame.thumbnail((768, 768))
+                            frame.save(output, format="JPEG", quality=82, optimize=True)
+                            encoded = base64.b64encode(output.getvalue()).decode("ascii")
+                        items.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+                    return items
+        except (OSError, ValueError, Image.DecompressionBombError) as error:
+            print(f"[Vision] Animation sampling unavailable ({content_type}): {type(error).__name__}")
+        return [{"type": "image_url", "image_url": {"url": image_url}}]
+
+    return await asyncio.to_thread(prepare)

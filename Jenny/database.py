@@ -6,12 +6,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
-# Anchor the DB file to this script's own folder, not the process's current
-# working directory. Previously DATABASE_FILE was just "memory.db", which
-# meant running the bot (or any other script that imports this module) from
-# a different folder silently created/used a *different* memory.db. This is
-# exactly what happened: there were two memory.db files in the toolkit with
-# different data in them, depending on where things were launched from.
+# Launchers and tools share the database beside the bot's Python source.
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DATABASE_FILE = str(_SCRIPT_DIR / "memory.db")
 _GUILD_SETTING_KEYS = {"main_channel_id", "logs_channel_id", "reply_mode", "jenny_enabled"}
@@ -29,6 +24,19 @@ def init_database() -> None:
     """Initialize the database with required tables"""
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode = WAL")
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS trivia_game_results (
+            id INTEGER PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+            username TEXT NOT NULL, points INTEGER NOT NULL, won INTEGER NOT NULL, played_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS trivia_game_results_scope ON trivia_game_results(guild_id, played_at);
+        CREATE TABLE IF NOT EXISTS invite_memberships (
+            id INTEGER PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+            inviter_id TEXT NOT NULL, joined_at TEXT NOT NULL, left_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS invite_memberships_scope ON invite_memberships(guild_id, joined_at);
+    """)
 
     # Users table for conversation history
     cursor.execute("""
@@ -172,6 +180,41 @@ def init_database() -> None:
             key TEXT NOT NULL,
             value TEXT,
             PRIMARY KEY (guild_id, key)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS free_game_alerts (
+            channel_id TEXT NOT NULL,
+            offer_key TEXT NOT NULL,
+            guild_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            expires_at INTEGER,
+            ended INTEGER NOT NULL DEFAULT 0,
+            stock_url TEXT,
+            remaining INTEGER,
+            PRIMARY KEY (channel_id, offer_key)
+        )
+    """)
+    alert_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(free_game_alerts)")}
+    if "stock_url" not in alert_columns:
+        cursor.execute("ALTER TABLE free_game_alerts ADD COLUMN stock_url TEXT")
+    if "remaining" not in alert_columns:
+        cursor.execute("ALTER TABLE free_game_alerts ADD COLUMN remaining INTEGER")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_free_game_expiry ON free_game_alerts(expires_at) WHERE ended = 0")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_free_game_stock ON free_game_alerts(stock_url) WHERE ended = 0")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_records (
+            channel_id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            opener_id TEXT NOT NULL,
+            panel_key TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            claimed_by TEXT,
+            closed_by TEXT,
+            closed_at TEXT,
+            transcript TEXT
         )
     """)
 
@@ -474,6 +517,17 @@ def init_database() -> None:
         CREATE INDEX IF NOT EXISTS idx_dm_voice_log_session
         ON dm_voice_log(dm_session_id)
     """)
+    cursor.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_global_log_channel_id ON global_log(channel_id, id);
+        CREATE INDEX IF NOT EXISTS idx_global_log_guild_time ON global_log(guild_id, timestamp, user_id);
+        CREATE INDEX IF NOT EXISTS idx_voice_chat_guild_time ON voice_chat(guild_id, timestamp, user_id);
+        CREATE INDEX IF NOT EXISTS idx_voice_chat_guild_id ON voice_chat(guild_id, id);
+        CREATE INDEX IF NOT EXISTS idx_token_usage_guild_time ON token_usage(guild_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_token_usage_user_time ON token_usage(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_service_usage_user_time ON service_usage(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_command_output_expiry ON command_output_cache(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_voice_sessions_open ON voice_sessions(guild_id, user_id) WHERE left_at IS NULL;
+    """)
 
     # Preserve model protocol roles, but label who each saved message came
     # from. This is a one-time JSON migration and keeps historical turns
@@ -686,22 +740,9 @@ def get_combined_user_summary(user_id: str, scope_id: Optional[str] = None) -> s
     return "\n\n".join(sections)
 
 
-def clear_user_conversations(user_id: str, guild_id: Optional[str] = None,
-                             dm_only: bool = False) -> None:
-    conn = get_connection()
-    if dm_only:
-        dm_conversation = f"dm:{user_id}"
-        dm_scope = f"dm:{user_id}"
-        conn.execute("DELETE FROM conversation_history WHERE user_id = ? AND conversation_id = ?",
-                     (str(user_id), dm_conversation))
-        conn.execute("DELETE FROM scoped_user_memory WHERE user_id = ? AND scope_id = ?",
-                     (str(user_id), dm_scope))
-    elif guild_id is None:
-        conn.execute("DELETE FROM conversation_history WHERE user_id = ?", (str(user_id),))
-        conn.execute("DELETE FROM scoped_user_memory WHERE user_id = ?", (str(user_id),))
-        conn.execute("DELETE FROM daily_user_memory WHERE user_id = ?", (str(user_id),))
-        conn.execute("DELETE FROM users WHERE user_id = ?", (str(user_id),))
-    else:
+def clear_user_conversations(user_id: str, guild_id: str) -> None:
+    """Remove one server's conversation turns and summary, preserving raw logs and other scopes."""
+    with closing(get_connection()) as conn, conn:
         guild_scope = f"guild:{guild_id}"
         conn.execute(
             "DELETE FROM conversation_history WHERE user_id = ? AND (conversation_id LIKE ? OR conversation_id LIKE ?)",
@@ -709,8 +750,76 @@ def clear_user_conversations(user_id: str, guild_id: Optional[str] = None,
         )
         conn.execute("DELETE FROM scoped_user_memory WHERE user_id = ? AND scope_id = ?",
                      (str(user_id), guild_scope))
-    conn.commit()
-    conn.close()
+
+
+def get_free_game_alerts(channel_id: int) -> dict:
+    with closing(get_connection()) as conn:
+        rows = conn.execute("SELECT offer_key, expires_at, ended FROM free_game_alerts WHERE channel_id = ?",
+                            (str(channel_id),)).fetchall()
+        return {row["offer_key"]: (row["expires_at"], bool(row["ended"])) for row in rows}
+
+
+def save_free_game_alert(guild_id: int, channel_id: int, offer_key: str, message_id: int,
+                         expires_at: Optional[int], stock_url: Optional[str] = None,
+                         remaining: Optional[int] = None) -> None:
+    with closing(get_connection()) as conn, conn:
+        conn.execute("""INSERT INTO free_game_alerts (guild_id, channel_id, offer_key, message_id, expires_at, stock_url, remaining)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""", (str(guild_id), str(channel_id), offer_key, str(message_id),
+                                                       expires_at, stock_url, remaining))
+
+
+def tracked_giveaway_stock():
+    with closing(get_connection()) as conn:
+        return conn.execute("""SELECT * FROM free_game_alerts WHERE ended = 0 AND stock_url IS NOT NULL""").fetchall()
+
+
+def update_giveaway_stock(channel_id: str, offer_key: str, remaining: int) -> None:
+    with closing(get_connection()) as conn, conn:
+        conn.execute("""UPDATE free_game_alerts SET remaining = ?, ended = ?
+                        WHERE channel_id = ? AND offer_key = ? AND ended = 0""",
+                     (remaining, int(remaining == 0), channel_id, offer_key))
+
+
+def update_free_game_expiry(channel_id: int, offer_key: str, expires_at: int) -> None:
+    with closing(get_connection()) as conn, conn:
+        conn.execute("UPDATE free_game_alerts SET expires_at = ? WHERE channel_id = ? AND offer_key = ? AND ended = 0",
+                     (expires_at, str(channel_id), offer_key))
+
+
+def due_free_game_alerts(now: int) -> list:
+    with closing(get_connection()) as conn:
+        return conn.execute("""SELECT * FROM free_game_alerts WHERE ended = 0 AND expires_at <= ?
+                            ORDER BY expires_at LIMIT 50""", (now,)).fetchall()
+
+
+def mark_free_game_ended(channel_id: str, offer_key: str) -> None:
+    with closing(get_connection()) as conn, conn:
+        conn.execute("UPDATE free_game_alerts SET ended = 1 WHERE channel_id = ? AND offer_key = ?",
+                     (channel_id, offer_key))
+
+
+def claim_ticket(channel_id, guild_id, opener_id, panel_key, slot, claimant_id):
+    """Assign the first claimant transactionally and return the existing owner on repeats."""
+    with closing(get_connection()) as conn, conn:
+        changed = conn.execute("""
+            INSERT INTO ticket_records (channel_id, guild_id, opener_id, panel_key, slot, claimed_by)
+            VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(channel_id) DO NOTHING
+        """, (str(channel_id), str(guild_id), str(opener_id), panel_key, slot, str(claimant_id))).rowcount
+        row = conn.execute("SELECT claimed_by, closed_at FROM ticket_records WHERE channel_id = ?",
+                           (str(channel_id),)).fetchone()
+        return bool(changed), row["claimed_by"], bool(row["closed_at"])
+
+
+def archive_ticket(channel_id, guild_id, opener_id, panel_key, slot, closer_id, transcript):
+    """Commit the transcript before the Discord channel may be removed."""
+    with closing(get_connection()) as conn, conn:
+        conn.execute("""
+            INSERT INTO ticket_records (channel_id, guild_id, opener_id, panel_key, slot, closed_by, closed_at, transcript)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET closed_by = excluded.closed_by, closed_at = excluded.closed_at,
+                transcript = excluded.transcript
+        """, (str(channel_id), str(guild_id), str(opener_id), panel_key, slot, str(closer_id),
+              datetime.now(timezone.utc).isoformat(), json.dumps(transcript, ensure_ascii=False)))
 
 
 def record_token_usage(user_id: str, guild_id: Optional[str], model: str,
@@ -821,20 +930,27 @@ def start_voice_session(guild_id: str, user_id: str, channel_id: str,
     conn.close()
 
 
-def close_stale_voice_sessions() -> int:
-    """Discard only unclosed intervals left by a prior bot process.
+def checkpoint_voice_sessions() -> None:
+    """Persist time seen while connected so a process exit loses only the unsaved tail."""
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(get_connection()) as conn, conn:
+        conn.execute("""UPDATE voice_sessions SET duration_ms = MAX(COALESCE(duration_ms, 0),
+                     CAST(ROUND((julianday(?) - julianday(joined_at)) * 86400000) AS INTEGER))
+                     WHERE left_at IS NULL""", (now,))
 
-    A gateway disconnect does not tell us when a member left voice, so counting
-    through the next process start would incorrectly include bot downtime.
-    Completed sessions remain intact; only the unknown tail is closed at its
-    recorded start time (zero additional duration).
-    """
-    conn = get_connection()
-    conn.execute("UPDATE voice_sessions SET left_at = joined_at, duration_ms = 0 WHERE left_at IS NULL")
-    closed_count = int(conn.execute("SELECT changes()").fetchone()[0])
-    conn.commit()
-    conn.close()
-    return closed_count
+
+def close_stale_voice_sessions() -> int:
+    """Close open intervals at the last saved checkpoint, excluding unknown downtime."""
+    with closing(get_connection()) as conn, conn:
+        rows = conn.execute("SELECT id, joined_at, duration_ms FROM voice_sessions WHERE left_at IS NULL").fetchall()
+        for row in rows:
+            duration = max(0, row["duration_ms"] or 0)
+            ended = row["joined_at"]
+            if duration:
+                ended = (datetime.fromisoformat(ended) + timedelta(milliseconds=duration)).isoformat()
+            conn.execute("UPDATE voice_sessions SET left_at = ?, duration_ms = ? WHERE id = ?",
+                         (ended, duration, row["id"]))
+        return len(rows)
 
 
 def end_voice_session(guild_id: str, user_id: str,
@@ -911,61 +1027,6 @@ def append_voice_turn_log(entry: Dict[str, Any]) -> None:
     path = log_dir / "voice-turns.jsonl"
     with _VOICE_LOG_LOCK, path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-
-
-def cleanup_expired_records(retention_days: int = 90) -> Dict[str, int]:
-    """Prune detailed chat, voice, token, and speech records beyond retention."""
-    days = max(7, min(int(retention_days), 3650))
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    conn = get_connection()
-    tables = {
-        "global_log": "timestamp",
-        "voice_chat": "timestamp",
-        "token_usage": "created_at",
-        "service_usage": "created_at",
-        "dm_text_log": "timestamp",
-        "dm_voice_log": "timestamp",
-        "user_profile_history": "timestamp",
-        "conversation_history": "updated_at",
-    }
-    deleted: Dict[str, int] = {}
-    for table, column in tables.items():
-        cursor = conn.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
-        deleted[table] = max(0, cursor.rowcount)
-    # This legacy raw-history column is no longer read by the current bot.
-    legacy_cursor = conn.execute(
-        "UPDATE users SET history = '[]' WHERE last_message_timestamp < ? AND history IS NOT NULL AND history != '[]'",
-        (cutoff,),
-    )
-    deleted["legacy_user_history_cleared"] = max(0, legacy_cursor.rowcount)
-    conn.execute("DELETE FROM image_context_cache WHERE created_at < ?", (cutoff,))
-    deleted["image_context_cache"] = max(0, conn.execute("SELECT changes()").fetchone()[0])
-    conn.execute("DELETE FROM voice_sessions WHERE joined_at < ? AND left_at IS NOT NULL", (cutoff,))
-    deleted["voice_sessions"] = max(0, conn.execute("SELECT changes()").fetchone()[0])
-    daily_cutoff = (datetime.now(timezone.utc).date() - timedelta(days=6)).isoformat()
-    conn.execute("DELETE FROM daily_user_memory WHERE summary_date < ?", (daily_cutoff,))
-    deleted["daily_user_memory"] = max(0, conn.execute("SELECT changes()").fetchone()[0])
-    conn.commit()
-    conn.close()
-
-    voice_log = _SCRIPT_DIR.parent / "logs" / "voice-turns.jsonl"
-    if voice_log.exists():
-        with _VOICE_LOG_LOCK:
-            retained_lines = []
-            try:
-                for line in voice_log.read_text(encoding="utf-8").splitlines():
-                    try:
-                        record = json.loads(line)
-                        if str(record.get("timestamp", "")) >= cutoff:
-                            retained_lines.append(json.dumps(record, ensure_ascii=False))
-                    except json.JSONDecodeError:
-                        continue
-                temporary_log = voice_log.with_suffix(".jsonl.tmp")
-                temporary_log.write_text("\n".join(retained_lines) + ("\n" if retained_lines else ""), encoding="utf-8")
-                temporary_log.replace(voice_log)
-            except OSError:
-                pass
-    return deleted
 
 
 def save_image_context(message_id: str, guild_id: Optional[str], user_id: str,
@@ -1052,63 +1113,49 @@ def update_last_message_timestamp(user_id: str) -> None:
 
 
 # Global log functions
-def get_recent_discord_results(channel_id: str, guild_id: Optional[str], limit: int = 6) -> str:
+def get_recent_discord_results(channel_id: str, guild_id: Optional[str], limit: int = 3) -> str:
     """Read recent visible command activity within the exact Discord channel."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
     with closing(get_connection()) as conn:
         rows = conn.execute("""
             SELECT content FROM global_log
             WHERE channel_id = ? AND guild_id IS ? AND timestamp >= ? AND author = 'Jenny (System)'
-              AND (content LIKE '[Command] %' OR content LIKE '[Result] %')
+              AND content LIKE '[Result] %'
             ORDER BY id DESC LIMIT ?
         """, (str(channel_id), str(guild_id) if guild_id else None, cutoff, limit)).fetchall()
-    return "\n".join(row["content"][:480] for row in reversed(rows))[-2400:]
+    return "\n".join(row["content"][:900] for row in rows)[:2400]
 
 
 def log_message(author: str, content: str, user_id: Optional[str] = None,
                 channel_id: Optional[str] = None, guild_id: Optional[str] = None) -> Optional[int]:
-    """Log a message to the global log"""
-    conn: sqlite3.Connection = get_connection()
-    cursor: sqlite3.Cursor = conn.cursor()
-    timestamp: str = datetime.now(timezone.utc).isoformat()
-    cursor.execute("""
-        INSERT INTO global_log (timestamp, author, user_id, content, channel_id, guild_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (timestamp, author, str(user_id) if user_id else None, content,
-          str(channel_id) if channel_id else None, str(guild_id) if guild_id else None))
-
-    conn.commit()
-
-    # Get the message ID that was just inserted
-    message_id: Optional[int] = cursor.lastrowid
-
-    conn.close()
-
-    # Internal maintenance notes are diagnostic records, not conversation turns.
-    if channel_id and author != "Jenny (System)":
-        increment_message_count(channel_id)
-
-    return message_id
+    """Record chat and its maintenance counter together."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with closing(get_connection()) as conn, conn:
+        cursor = conn.execute("""
+            INSERT INTO global_log (timestamp, author, user_id, content, channel_id, guild_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (timestamp, author, str(user_id) if user_id else None, content,
+              str(channel_id) if channel_id else None, str(guild_id) if guild_id else None))
+        if channel_id and author not in {"Jenny", "Jenny (System)"}:
+            _increment_stream(conn, channel_id, "text", timestamp)
+        return cursor.lastrowid
 
 
 def log_voice_chat(user_id: str, username: str, transcript: str, response: str,
                    guild_id: str, channel_id: Optional[str] = None,
                    timings_ms: Optional[Dict[str, int]] = None,
                    speech_duration_ms: int = 0) -> None:
-    """Log a voice chat interaction to the voice_chat table"""
-    conn: sqlite3.Connection = get_connection()
-    cursor: sqlite3.Cursor = conn.cursor()
+    """Store a voice turn and the maintenance counter in one transaction."""
     timestamp: str = datetime.now(timezone.utc).isoformat()
-    cursor.execute("""
-        INSERT INTO voice_chat
-            (timestamp, user_id, username, transcript, response, guild_id, channel_id, timings_json, speech_duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (timestamp, str(user_id), username, transcript, response, str(guild_id),
-          str(channel_id) if channel_id else None, json.dumps(timings_ms or {}),
-          max(0, int(speech_duration_ms or 0))))
-
-    conn.commit()
-    conn.close()
+    with closing(get_connection()) as conn, conn:
+        conn.execute("""
+            INSERT INTO voice_chat
+                (timestamp, user_id, username, transcript, response, guild_id, channel_id, timings_json, speech_duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (timestamp, str(user_id), username, transcript, response, str(guild_id),
+              str(channel_id) if channel_id else None, json.dumps(timings_ms or {}),
+              max(0, int(speech_duration_ms or 0))))
+        _increment_stream(conn, guild_id, "voice", timestamp)
 
 
 def update_voice_chat_response(user_id: str, guild_id: str, transcript: str, response: str,
@@ -1153,16 +1200,6 @@ def update_voice_chat_timings(user_id: str, guild_id: str, transcript: str,
                      (json.dumps(timings), row["id"]))
     conn.commit()
     conn.close()
-
-
-def get_dm_sessions() -> List[str]:
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT dm_session_id FROM dm_text_log WHERE dm_session_id IS NOT NULL
-        UNION SELECT dm_session_id FROM dm_voice_log WHERE dm_session_id IS NOT NULL
-    """).fetchall()
-    conn.close()
-    return [row[0] for row in rows]
 
 
 def get_dm_text_for_maintenance(session_id: str, after_id: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
@@ -1845,20 +1882,28 @@ def defer_memory_maintenance(channel_id: str, stream_type: str) -> datetime:
     return retry_after
 
 
-def increment_message_count(channel_id: str, stream_type: str = "text") -> None:
-    """Increment the message count since last maintenance for a stream type"""
-    conn: sqlite3.Connection = get_connection()
-    cursor: sqlite3.Cursor = conn.cursor()
-
-    cursor.execute("""
+def _increment_stream(conn, channel_id, stream_type, timestamp):
+    conn.execute("""
         INSERT INTO memory_maintenance (channel_id, stream_type, last_maintenance_time, last_message_id_processed, messages_since_maintenance)
         VALUES (?, ?, ?, 0, 1)
         ON CONFLICT(channel_id, stream_type) DO UPDATE SET
             messages_since_maintenance = messages_since_maintenance + 1
-    """, (str(channel_id), stream_type, datetime.now(timezone.utc).isoformat()))
+    """, (str(channel_id), stream_type, timestamp))
 
-    conn.commit()
-    conn.close()
+
+def increment_message_count(channel_id: str, stream_type: str = "text") -> None:
+    """Queue a record for a stream whose message was stored elsewhere."""
+    with closing(get_connection()) as conn, conn:
+        _increment_stream(conn, channel_id, stream_type, datetime.now(timezone.utc).isoformat())
+
+
+def active_memory_streams() -> list[tuple[str, str]]:
+    """Return only streams with pending records, including older DM streams."""
+    with closing(get_connection()) as conn:
+        return [(row[0], row[1]) for row in conn.execute("""
+            SELECT channel_id, stream_type FROM memory_maintenance
+            WHERE messages_since_maintenance > 0
+        """)]
 
 
 def should_trigger_memory_maintenance(channel_id: str, stream_type: str = "text", message_threshold: int = 100, hours_threshold: int = 24) -> bool:
@@ -1903,8 +1948,7 @@ def get_messages_for_maintenance(channel_id: str, limit: int = 100) -> List[Dict
     info = get_memory_maintenance_info(channel_id)
     last_id: int = info.get("last_message_id_processed", 0)
 
-    # CRITICAL FIX: Filter by channel_id to ensure we only get messages from the specific channel
-    # The previous implementation was missing this filter, causing cross-channel message retrieval
+    # Filter by channel before applying the stream's saved cursor.
     cursor.execute("""
         SELECT id, timestamp, author, user_id, content
         FROM global_log
@@ -2050,6 +2094,11 @@ def record_trivia_game(guild_id: str, player_scores: Dict[str, Dict[str, Any]],
     now = datetime.now(timezone.utc).isoformat()
     conn = get_connection()
     for user_id, data in player_scores.items():
+        player = str(data.get("username") or user_id)
+        points = int(data.get("points") or 0)
+        won = int(str(user_id) in winners)
+        conn.execute("""INSERT INTO trivia_game_results(guild_id,user_id,username,points,won,played_at)
+                      VALUES (?,?,?,?,?,?)""", (str(guild_id), str(user_id), player, points, won, now))
         conn.execute(
             """INSERT INTO trivia_scores (guild_id, user_id, username, points, games_played, games_won, updated_at)
                VALUES (?, ?, ?, ?, 1, ?, ?)
@@ -2059,24 +2108,87 @@ def record_trivia_game(guild_id: str, player_scores: Dict[str, Dict[str, Any]],
                  games_played=trivia_scores.games_played + 1,
                  games_won=trivia_scores.games_won + excluded.games_won,
                  updated_at=excluded.updated_at""",
-            (str(guild_id), str(user_id), str(data.get("username") or user_id),
-             int(data.get("points") or 0), 1 if str(user_id) in winners else 0, now),
+            (str(guild_id), str(user_id), player, points, won, now),
         )
     conn.commit()
     conn.close()
 
 
-def get_trivia_leaderboard(guild_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+def get_trivia_leaderboard(guild_id: str, limit: int = 100, since: str = "", order: str = "points") -> List[Dict[str, Any]]:
     """Return players who have participated in this server's trivia games."""
     conn = get_connection()
-    rows = conn.execute(
-        """SELECT user_id, username, points, games_played, games_won, updated_at
-           FROM trivia_scores WHERE guild_id = ?
-           ORDER BY points DESC, games_won DESC, games_played ASC, username COLLATE NOCASE ASC
-           LIMIT ?""",
-        (str(guild_id), max(1, min(int(limit), 500))),
-    ).fetchall()
+    order = "games_won DESC, points DESC" if order == "wins" else "points DESC, games_won DESC"
+    maximum = max(1, min(int(limit), 10000))
+    if since:
+        rows = conn.execute(f"""SELECT user_id, MAX(username) AS username, SUM(points) AS points,
+                            COUNT(*) AS games_played, SUM(won) AS games_won
+                            FROM trivia_game_results WHERE guild_id = ? AND played_at >= ?
+                            GROUP BY user_id ORDER BY {order}, user_id LIMIT ?""",
+                            (str(guild_id), since, maximum)).fetchall()
+    else:
+        rows = conn.execute(f"""SELECT user_id,username,points,games_played,games_won FROM trivia_scores
+                            WHERE guild_id = ? ORDER BY {order},user_id LIMIT ?""",
+                            (str(guild_id), maximum)).fetchall()
     conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_activity_ranks(guild_id, since, mode):
+    if mode == "text":
+        with closing(get_connection()) as conn:
+            rows = conn.execute("""SELECT user_id, COUNT(*) AS amount FROM global_log
+                WHERE guild_id = ? AND timestamp >= ? AND user_id IS NOT NULL
+                  AND author NOT IN ('Jenny', 'Jenny (System)') AND content NOT LIKE '[voice note transcript] %'
+                GROUP BY user_id ORDER BY amount DESC, user_id""", (str(guild_id), since)).fetchall()
+        return [dict(row) for row in rows]
+    now = datetime.now(timezone.utc)
+    boundary = datetime.fromisoformat(since) if since else datetime.min.replace(tzinfo=timezone.utc)
+    with closing(get_connection()) as conn:
+        rows = conn.execute("""SELECT user_id, joined_at, left_at FROM voice_sessions
+                              WHERE guild_id = ? AND (left_at IS NULL OR left_at >= ?)""", (str(guild_id), since)).fetchall()
+    totals = {}
+    for row in rows:
+        try:
+            joined = datetime.fromisoformat(row["joined_at"])
+            ended = datetime.fromisoformat(row["left_at"]) if row["left_at"] else now
+            joined = joined if joined.tzinfo else joined.replace(tzinfo=timezone.utc)
+            ended = ended if ended.tzinfo else ended.replace(tzinfo=timezone.utc)
+            duration = int((min(ended, now) - max(joined, boundary)).total_seconds())
+            if duration > 0:
+                totals[row["user_id"]] = totals.get(row["user_id"], 0) + duration
+        except (ValueError, TypeError):
+            continue
+    return [{"user_id": user_id, "amount": duration}
+            for user_id, duration in sorted(totals.items(), key=lambda pair: (-pair[1], pair[0]))]
+
+
+def record_attributed_invite(guild_id, user_id, inviter_id):
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(get_connection()) as conn, conn:
+        conn.execute("""INSERT INTO invite_memberships(guild_id,user_id,inviter_id,joined_at)
+                       SELECT ?,?,?,? WHERE NOT EXISTS (
+                        SELECT 1 FROM invite_memberships WHERE guild_id=? AND user_id=? AND left_at IS NULL)""",
+                     (str(guild_id), str(user_id), str(inviter_id), now, str(guild_id), str(user_id)))
+
+
+def record_invited_departure(guild_id, user_id):
+    with closing(get_connection()) as conn, conn:
+        conn.execute("UPDATE invite_memberships SET left_at=? WHERE guild_id=? AND user_id=? AND left_at IS NULL",
+                     (datetime.now(timezone.utc).isoformat(), str(guild_id), str(user_id)))
+
+
+def get_invite_ranks(guild_id, since="", mode="invited", user_id=None):
+    where = "guild_id=? AND joined_at>=?"
+    params = [str(guild_id), since]
+    if user_id is not None:
+        where += " AND inviter_id=?"
+        params.append(str(user_id))
+    order = "departed DESC, invited DESC" if mode == "left" else "invited DESC, departed ASC"
+    with closing(get_connection()) as conn:
+        rows = conn.execute(f"""SELECT inviter_id AS user_id,COUNT(*) AS invited,SUM(has_left) AS departed
+            FROM (SELECT inviter_id,user_id,MIN(left_at IS NOT NULL) AS has_left
+                  FROM invite_memberships WHERE {where} GROUP BY inviter_id,user_id)
+            GROUP BY inviter_id ORDER BY {order},inviter_id""", params).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -2097,7 +2209,6 @@ def add_changelog_entry(version: str, description: str, features: List[str], cha
             description = excluded.description,
             features = excluded.features,
             changes = excluded.changes,
-            date = excluded.date,
             type = excluded.type
     """, (version, description, features_json, changes_json, timestamp, entry_type))
 
@@ -2106,81 +2217,69 @@ def add_changelog_entry(version: str, description: str, features: List[str], cha
     print(f"[Changelog] Added entry for version {version}")
 
 
+def _markdown_changelog() -> List[Dict[str, Any]]:
+    markdown = (_SCRIPT_DIR.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    entries = []
+    for section_text in markdown.split("\n## ")[1:]:
+        version, _, release = section_text.partition("\n")
+        version = version.strip().removeprefix("v")
+        if not version or not version[0].isdigit():
+            continue
+        features, changes = [], []
+        description = next((line.strip() for line in release.splitlines() if line.strip()), "")
+        if not description or description.startswith(("#", "-")):
+            description = f"Jenny {version}"
+        section = changes
+        for line in release.splitlines():
+            if line.startswith("### "):
+                heading = line.removeprefix("### ").casefold()
+                section = features if heading in {"added", "added and improved", "what jenny can do"} else changes
+            elif line.startswith("- "):
+                section.append(line[2:])
+        if features or changes:
+            entries.append({"version": version, "description": description, "features": features, "changes": changes})
+    return entries
+
+
 def get_changelog() -> List[Dict[str, Any]]:
-    """Get all changelog entries"""
-    conn: sqlite3.Connection = get_connection()
-    cursor: sqlite3.Cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT version, description, features, changes, date, type
-        FROM changelog
-        ORDER BY date DESC
-    """)
-    
-    rows = cursor.fetchall()
-    conn.close()
-    
-    return [
-        {
+    """Use the checked-in release order and retain any older local entries."""
+    with closing(get_connection()) as conn:
+        rows = conn.execute("SELECT * FROM changelog ORDER BY date DESC").fetchall()
+    stored = {
+        row["version"]: {
             "version": row["version"],
             "description": row["description"],
             "features": json.loads(row["features"]) if row["features"] else [],
             "changes": json.loads(row["changes"]) if row["changes"] else [],
             "date": row["date"],
-            "type": row["type"]
+            "type": row["type"],
         }
         for row in rows
-    ]
-
-
-# Function to initialize changelog entries (call this after bot is fully started)
-def initialize_changelog() -> None:
-    """Import the current Markdown release notes without deleting stored history."""
-    version = "0.95bf"
+    }
     try:
-        markdown = (_SCRIPT_DIR.parent / "CHANGELOG.md").read_text(encoding="utf-8")
-        release = markdown.partition(f"\n## {version}\n")[2].partition("\n## ")[0]
-        features, changes = [], []
-        section = changes
-        for line in release.splitlines():
-            if line.startswith("### "):
-                section = features if line == "### Added" else changes
-            elif line.startswith("- "):
-                section.append(line[2:])
-        if not features and not changes:
-            raise ValueError(f"Missing notes for version {version} in CHANGELOG.md")
+        notes = _markdown_changelog()
+    except (OSError, UnicodeError):
+        notes = []
+    published = [
+        {**stored.pop(entry["version"], {"type": "release"}), **entry}
+        for entry in notes
+    ]
+    return published + list(stored.values())
+
+
+def initialize_changelog() -> None:
+    """Record the current release locally while keeping prior stored entries."""
+    try:
+        notes = _markdown_changelog()
+        if not notes:
+            raise ValueError("No release notes found in CHANGELOG.md")
         add_changelog_entry(
-            version=version,
-            description="Server tools, voice improvements, and flexible provider keys",
-            features=features,
-            changes=changes,
+            **notes[0],
             entry_type="release",
         )
     except Exception as error:
         print(f"[Changelog] Error initializing changelog: {error}")
 
 def get_latest_changelog() -> Optional[Dict[str, Any]]:
-    """Get the latest changelog entry"""
-    conn: sqlite3.Connection = get_connection()
-    cursor: sqlite3.Cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT version, description, features, changes, date, type
-        FROM changelog
-        ORDER BY date DESC
-        LIMIT 1
-    """)
-    
-    row = cursor.fetchone()
-    conn.close()
-    
-    if row:
-        return {
-            "version": row["version"],
-            "description": row["description"],
-            "features": json.loads(row["features"]) if row["features"] else [],
-            "changes": json.loads(row["changes"]) if row["changes"] else [],
-            "date": row["date"],
-            "type": row["type"]
-        }
-    return None
+    """Get the first release in the changelog."""
+    return next(iter(get_changelog()), None)

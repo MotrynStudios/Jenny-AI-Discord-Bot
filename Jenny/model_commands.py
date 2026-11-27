@@ -9,7 +9,12 @@ from discord import app_commands
 
 from discord_commands import DM_COMMANDS, send_more_from_cache
 from database import log_message
+from audit_log import send_audit
+from command_runtime import COMMAND_TIMEOUT
 import asyncio
+
+
+OPTION_TYPES = discord.AppCommandOptionType
 
 
 def parse_model_command(reply):
@@ -26,7 +31,8 @@ def contains_control_text(text):
 
 
 SLASH_ONLY_COMMANDS = {"mute", "ban", "kick", "timeout", "ticketpanel", "reactionroles",
-                       "freegames", "restart", "update"}
+                       "freegames", "freegamesrole", "myaddons", "restart", "update", "copyembed", "claimticket", "welcome", "joinrole",
+                       "language", "forget"}
 
 
 def command_allowed(command, actor, guild):
@@ -40,17 +46,30 @@ def command_allowed(command, actor, guild):
 
 def command_catalog(bot, actor, guild):
     lines = []
-    for command in bot.tree.get_commands():
+    for command in bot.tree.walk_commands():
         if not isinstance(command, app_commands.Command) or not command_allowed(command, actor, guild):
             continue
-        args = []
+        args, descriptions = [], []
         for parameter in command.parameters:
             choices = "/".join(str(choice.value) for choice in parameter.choices)
             kind = choices or parameter.type.name
-            args.append(f"{parameter.name}:{kind}{'' if parameter.required else '?'}")
-        lines.append(f"{command.name} {' '.join(args)} | {command.description}")
+            bounds = (parameter.min_value, parameter.max_value)
+            if not choices and any(bound is not None for bound in bounds):
+                units = " chars" if parameter.type == OPTION_TYPES.string else ""
+                kind += f"[{bounds[0] if bounds[0] is not None else ''}..{bounds[1] if bounds[1] is not None else ''}{units}]"
+            default = parameter.default
+            optional = "" if parameter.required else "?"
+            if optional and type(default) in {bool, int, float, str} and default != "":
+                optional += f"={json.dumps(default, ensure_ascii=False)}"
+            args.append(f"{parameter.name}:{kind}{optional}")
+            if parameter.description and parameter.description != "…":
+                descriptions.append(f"{parameter.name}: {parameter.description}")
+        info = " · ".join([command.description, *descriptions])
+        lines.append(f"{' '.join([command.qualified_name.replace(' ', '_'), *args])} | {info}")
     return (
         "Available command names and arguments (? means optional). For your own usage select myusage. "
+        "Include the user's requested options even if they are optional. "
+        "For example, 'roll 3 dice' uses CMD:roll {\"dice\":3}. "
         "Use the exact current member name, mention or ID for member arguments; use 'me' for the requester. "
         "For 'my roles' pass user='me' to roles. Without a user, roles lists the server's roles. "
         "Use next_result only when asked to advance an existing saved paged result or solo trivia. "
@@ -60,7 +79,7 @@ def command_catalog(bot, actor, guild):
 
 
 def describe_discord_message(message, limit=2800):
-    """Capture the visible content of the exact message, including embed-only replies."""
+    """Capture visible text from messages, embeds, and Discord cards."""
     parts = [message.content] if message.content else []
     for embed in message.embeds[:4]:
         for value in (embed.title, embed.description):
@@ -70,6 +89,12 @@ def describe_discord_message(message, limit=2800):
         if embed.footer.text:
             parts.append(embed.footer.text)
     parts.extend(f"Attachment: {attachment.filename}" for attachment in message.attachments[:4])
+    pending = list(reversed(getattr(message, "components", [])))
+    while pending and len(parts) < 20:
+        component = pending.pop()
+        if component.type is discord.ComponentType.text_display and component.content:
+            parts.append(component.content)
+        pending.extend(reversed(getattr(component, "children", [])))
     return "\n".join(parts)[:limit]
 
 
@@ -162,15 +187,26 @@ def _resolve_argument(parameter, value, context):
             options = ", ".join(f"{item.name} ({item.id})" for item in matches[:5])
             raise ValueError(f"Which {kind.name} did you mean by {value!s}?" + (f" Matches: {options}." if options else " No exact match."))
         return matches[0]
-    if kind == discord.AppCommandOptionType.integer and type(value) is not int:
-        raise ValueError(f"{name} must be a whole number.")
-    if kind == discord.AppCommandOptionType.string and not isinstance(value, str):
+    if kind == OPTION_TYPES.integer:
+        if isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value.strip()):
+            value = int(value)
+        if type(value) is not int:
+            raise ValueError(f"{name} must be a whole number.")
+    elif kind == OPTION_TYPES.string and not isinstance(value, str):
         raise ValueError(f"{name} must be text.")
+    elif kind == OPTION_TYPES.boolean and type(value) is not bool:
+        raise ValueError(f"{name} must be true or false.")
+    elif kind == OPTION_TYPES.number and type(value) not in {int, float}:
+        raise ValueError(f"{name} must be a number.")
     if parameter.choices and value not in {choice.value for choice in parameter.choices}:
         raise ValueError(f"Choose a valid value for {name}.")
-    if ((parameter.min_value is not None and value < parameter.min_value)
-            or (parameter.max_value is not None and value > parameter.max_value)):
-        raise ValueError(f"{name} must be between {parameter.min_value} and {parameter.max_value}.")
+    measured = len(value) if kind == OPTION_TYPES.string else value
+    if parameter.min_value is not None and measured < parameter.min_value:
+        units = " characters" if kind == OPTION_TYPES.string else ""
+        raise ValueError(f"{name} must be at least {parameter.min_value}{units}.")
+    if parameter.max_value is not None and measured > parameter.max_value:
+        units = " characters" if kind == OPTION_TYPES.string else ""
+        raise ValueError(f"{name} must be at most {parameter.max_value}{units}.")
     return value
 
 
@@ -200,7 +236,8 @@ async def execute_model_command(bot, context, command_name, payload):
             if not await send_more_from_cache(context, str(context.user.id), context.guild_id, scope, target):
                 raise ValueError("There is no recent result to continue here.")
         else:
-            command = bot.tree.get_command(command_name)
+            command = next((entry for entry in bot.tree.walk_commands()
+                            if entry.qualified_name.replace(" ", "_") == command_name), None)
             if not isinstance(command, app_commands.Command) or not command_allowed(command, context.user, context.guild):
                 raise ValueError("That command is unavailable here or requires additional permissions.")
             context.command = command
@@ -224,11 +261,16 @@ async def execute_model_command(bot, context, command_name, payload):
                                         context.user.id, context.channel_id, context.guild_id)
             except Exception as error:
                 print(f"[CONTEXT] Could not record command activity: {error}")
-            await command.callback(context, **resolved)
+            if command.default_permissions:
+                await send_audit(context.guild, f"Admin command · /{command.qualified_name}",
+                                 "Requested through Jenny.", actor=context.user, source=context.channel)
+            async with asyncio.timeout(COMMAND_TIMEOUT):
+                await command.callback(context, **resolved)
         return context.result, acknowledgement
     except Exception as error:
         context.failed = True
         print(f"[COMMAND] /{command_name} failed: {type(error).__name__}: {error}")
-        detail = str(error)[:1000] if isinstance(error, ValueError) else "I couldn't finish that command."
+        detail = ("This command timed out. Check Jenny's logs for details." if isinstance(error, TimeoutError)
+                  else str(error)[:1000] if isinstance(error, ValueError) else "I couldn't finish that command.")
         await context.send(embed=discord.Embed(title="Command unavailable", description=detail, color=discord.Color.red()))
         return context.result, ""

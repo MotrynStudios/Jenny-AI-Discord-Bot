@@ -1,12 +1,20 @@
-"""Mirror Python stdout and stderr to a bounded runtime log file."""
+"""Mirror Python stdout and stderr to a per-session runtime log file."""
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import threading
-from logging.handlers import RotatingFileHandler
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
+from uuid import uuid4
+
+
+_CONSOLE_LEVEL = re.compile(
+    r"^(?:\[[^\]]+\]\s+\[)?(DEBUG|INFO|WARNING|ERROR|CRITICAL)(?:\s*\]|:|\s+-)"
+)
 
 
 class _TeeStream:
@@ -27,15 +35,20 @@ class _TeeStream:
             self.pending += text
             while "\n" in self.pending:
                 line, self.pending = self.pending.split("\n", 1)
-                self.logger.log(self.level, line.rstrip("\r"))
+                self._log_line(line)
             return len(text) if written is None else written
 
     def flush(self) -> None:
         with self.lock:
             self.console.flush()
             if self.pending:
-                self.logger.log(self.level, self.pending.rstrip("\r"))
+                self._log_line(self.pending)
                 self.pending = ""
+
+    def _log_line(self, line: str) -> None:
+        match = _CONSOLE_LEVEL.match(line)
+        level = logging.getLevelNamesMapping()[match[1]] if match else self.level
+        self.logger.log(level, line.rstrip("\r"))
 
     def isatty(self) -> bool:
         return bool(getattr(self.console, "isatty", lambda: False)())
@@ -48,7 +61,7 @@ class _TeeStream:
 
 
 def configure_runtime_logging() -> None:
-    """Capture Python stdout/stderr in logs/python-runtime.log with rotation."""
+    """Start a fresh dated log session while retaining earlier sessions."""
     if getattr(sys, "_jenny_runtime_logging_enabled", False):
         return
     project_root = Path(__file__).resolve().parents[1]
@@ -57,10 +70,22 @@ def configure_runtime_logging() -> None:
     logger = logging.getLogger("jenny.runtime")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    handler = RotatingFileHandler(
-        log_dir / "python-runtime.log", maxBytes=8_000_000, backupCount=4, encoding="utf-8"
-    )
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    latest = log_dir / "python-latest.log"
+    if latest.exists():
+        with latest.open(encoding="utf-8", errors="replace") as stream:
+            first_line = stream.readline()
+        try:
+            started = datetime.fromisoformat(first_line.split(" ", 1)[0])
+        except ValueError:
+            started = datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc)
+        archived = log_dir / f"python-{started:%Y-%m-%d_%H-%M-%S}Z.log"
+        if archived.exists():
+            archived = log_dir / f"python-{started:%Y-%m-%d_%H-%M-%S}Z-{uuid4().hex[:8]}.log"
+        latest.rename(archived)
+    handler = logging.FileHandler(latest, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+    formatter.converter = time.gmtime
+    handler.setFormatter(formatter)
     logger.addHandler(handler)
     sys.stdout = _TeeStream(sys.__stdout__, logger, logging.INFO)  # type: ignore[assignment]
     sys.stderr = _TeeStream(sys.__stderr__, logger, logging.ERROR)  # type: ignore[assignment]
